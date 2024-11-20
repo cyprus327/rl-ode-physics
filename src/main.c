@@ -1,5 +1,3 @@
-#include <ode/contact.h>
-#include <ode/objects.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -11,7 +9,7 @@
 #include "ode/ode.h"
 
 #define MAX_PITCH (89.f * DEG2RAD)
-#define MAX_SHAPES 512
+#define MAX_BODIES 512
 
 #define SHADOWMAP_RESOLUTION 1024
 
@@ -19,7 +17,8 @@ static Camera cam = { .position = {0.f, 2.f, -3.f}, .fovy = 90.f, .projection = 
 
 typedef enum bodyType {
     BODYTYPE_SPHERE,
-    BODYTYPE_BOX
+    BODYTYPE_BOX,
+    BODYTYPE_TRIMESH
 } BodyType;
 
 typedef struct body {
@@ -31,7 +30,7 @@ typedef struct body {
     Color color;
 } Body;
 
-static Body bodies[MAX_SHAPES];
+static Body bodies[MAX_BODIES];
 static int bodiesCount;
 
 static dWorldID world;
@@ -47,9 +46,11 @@ static int Rand_Int(int min, int max);
 static double Rand_Double(double min, double max);
 
 static void HandleInput(Camera3D* camera, float moveSpeed, float turnSpeed, float dt);
-static int AddBody(BodyType type, Vector3 pos, Vector3 size, char isKinematic);
 static void NearCallback(void* data, dGeomID o1, dGeomID o2);
+static int AddBody(BodyType type, Vector3 pos, Vector3 size, char isKinematic);
+static int AddBodyTris(Model model, Vector3 pos, Vector3 size, char isKinematic);
 
+// all shadowmap stuff copied from the raylib example shadowmap project
 static RenderTexture LoadShadowmapRenderTexture(int width, int height);
 static void UnloadShadowmapRenderTexture(RenderTexture2D target);
 
@@ -58,20 +59,14 @@ static void DrawScene(void) {
     for (int i = 0; i < bodiesCount; i++) {
         const dReal* pos = dBodyGetPosition(bodies[i].body);
         const dReal* rot = dBodyGetRotation(bodies[i].body);
-        const float transform[16] = { // ode returns column major
-            rot[0], rot[4], rot[8], 0.0f,
-            rot[1], rot[5], rot[9], 0.0f,
-            rot[2], rot[6], rot[10], 0.0f,
-            pos[0], pos[1], pos[2], 1.0f
+        bodies[i].display.transform = (Matrix){
+            rot[0], rot[1], rot[2], pos[0],
+            rot[4], rot[5], rot[6], pos[1],
+            rot[8], rot[9], rot[10], pos[2],
+            0.f, 0.f, 0.f, 1.f
         };
 
-        rlPushMatrix();
-        rlMultMatrixf(transform);
-
-        // memcpy(&bodies[i].display.transform, transform, sizeof(transform));
-        DrawModel(bodies[i].display, Vector3Zero(), 1.f, bodies[i].color);
-
-        rlPopMatrix();
+        DrawModel(bodies[i].display, (Vector3){0.f, 0.f, 0.f}, 1.f, bodies[i].color);
     }
 }
 
@@ -88,8 +83,6 @@ int main(void) {
 
     randState = (unsigned int)time(NULL);
 
-    const Texture texture = LoadTexture("res/grassTexture.png");
-
     const Shader shadowShader = LoadShader("res/shadowMap.vert", "res/shadowMap.frag");
     shadowShader.locs[SHADER_LOC_VECTOR_VIEW] = GetShaderLocation(shadowShader, "viewPos");
     const int lightDirLoc = GetShaderLocation(shadowShader, "lightDir");
@@ -101,7 +94,7 @@ int main(void) {
     Vector3 lightDir = Vector3Normalize((Vector3){ 0.35f, -1.0f, -0.35f });
     SetShaderValue(shadowShader, lightDirLoc, &lightDir, SHADER_UNIFORM_VEC3);
 
-    Color lightColor = WHITE;
+    Color lightColor = (Color){255, 220, 220, 255};
     const Vector4 lightColorNormalized = ColorNormalize(lightColor);
     SetShaderValue(shadowShader, lightColLoc, &lightColorNormalized, SHADER_UNIFORM_VEC4);
 
@@ -112,17 +105,26 @@ int main(void) {
     SetShaderValue(shadowShader, GetShaderLocation(shadowShader, "shadowMapResolution"), &shadowMapResolution, SHADER_UNIFORM_INT);
 
     const RenderTexture shadowMap = LoadShadowmapRenderTexture(SHADOWMAP_RESOLUTION, SHADOWMAP_RESOLUTION);
+    SetTextureFilter(shadowMap.depth, TEXTURE_FILTER_BILINEAR);
+
     Camera3D lightCam = (Camera3D){0};
-    lightCam.target = Vector3Zero();
+    lightCam.target = Vector3One();
     // Use an orthographic projection for directional lights
     lightCam.projection = CAMERA_ORTHOGRAPHIC;
     lightCam.up = (Vector3){ 0.0f, 1.0f, 0.0f };
     lightCam.fovy = 30.0f;
 
+    const Texture texture = LoadTexture("res/test.png");
+    SetTextureFilter(texture, TEXTURE_FILTER_BILINEAR);
+
+    // works just messed up collisions
+    // const int body0 = AddBodyTris(LoadModel("res/grassPlane.obj"), (Vector3){0.f, 0.f, 0.f}, (Vector3){0.1f, 0.1f, 0.1f}, 1);
+    // bodies[body0].display.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = texture;
+
     const dGeomID floorID = dCreatePlane(space, 0, 1, 0, 0);
     floorModel = LoadModelFromMesh(GenMeshCube(50.f, 1.f, 50.f));
     floorModel.materials[0].shader = shadowShader;
-    floorModel.materials[0].maps[0].texture = texture;
+    floorModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = texture;
 
     while (!WindowShouldClose()) {
         const double deltaTime = GetFrameTime();
@@ -150,12 +152,12 @@ int main(void) {
 
         static float spawnTimer = 0.f;
         spawnTimer += deltaTime;
-        if (spawnTimer > 0.05f && bodiesCount < MAX_SHAPES) {
+        if (spawnTimer > 0.05f && bodiesCount < MAX_BODIES) {
             spawnTimer = 0.0f;
 
             const Vector3 pos = {Rand_Double(-6.0, 6.0), Rand_Double(20.0, 50.0), Rand_Double(-6.0, 6.0)};
             int added;
-            switch ((BodyType)Rand_Int(0, 2)) {
+            switch (Rand_Int(0, 2)) {
                 case BODYTYPE_BOX: {
                     added = AddBody(BODYTYPE_BOX, pos, (Vector3){Rand_Double(0.2, 1.0), Rand_Double(0.2, 1.0), Rand_Double(0.2, 1.0)}, 0);
                 } break;
@@ -197,7 +199,7 @@ int main(void) {
                 for (int i = 0; i < bodiesCount; i++) {
                     const dReal* pos = dBodyGetPosition(bodies[i].body);
                     const dReal* rot = dBodyGetRotation(bodies[i].body);
-                    const float transform[16] = { // ode returns column major
+                    const float transform[16] = {
                         rot[0], rot[4], rot[8], 0.0f,
                         rot[1], rot[5], rot[9], 0.0f,
                         rot[2], rot[6], rot[10], 0.0f,
@@ -210,12 +212,15 @@ int main(void) {
                     switch (bodies[i].type) {
                         case BODYTYPE_SPHERE: {
                             const float radius = dGeomSphereGetRadius(bodies[i].geom);
-                            DrawSphereWires(Vector3Zero(), radius, 12, 12, MAGENTA);
+                            DrawSphereWires((Vector3){0.f, 0.f, 0.f}, radius, 12, 12, MAGENTA);
                         } break;
                         case BODYTYPE_BOX: {
                             dVector3 sides;
                             dGeomBoxGetLengths(bodies[i].geom, sides);
-                            DrawCubeWires(Vector3Zero(), sides[0], sides[1], sides[2], MAGENTA);
+                            DrawCubeWires((Vector3){0.f, 0.f, 0.f}, sides[0], sides[1], sides[2], MAGENTA);
+                        } break;
+                        case BODYTYPE_TRIMESH: {
+                            DrawModelWires(bodies[i].display, (Vector3){0.f, 0.f, 0.f}, 1.f, MAGENTA);
                         } break;
                     }
 
@@ -224,7 +229,8 @@ int main(void) {
             } else {
                 DrawScene();
             }
-            DrawSphere(lightCam.position, 1.f, BLUE);
+            DrawSphere(lightCam.position, 1.f, lightColor);
+            DrawSphereWires(lightCam.position, 1.f, 10, 10, BLACK);
         EndMode3D();
         if (IsKeyDown(KEY_Z)) {
             DrawTextureEx(shadowMap.depth, (Vector2){0, 0}, 0.f, 0.6f, WHITE);
@@ -248,30 +254,52 @@ int main(void) {
     return 0;
 }
 
+static void NearCallback(void* data, dGeomID o1, dGeomID o2) {
+    const int MAX_CONTACTS = 8;
+    dContact contacts[MAX_CONTACTS];
+
+    const int nc = dCollide(o1, o2, MAX_CONTACTS, &contacts[0].geom, sizeof(dContact));
+    if (nc <= 0) {
+        return;
+    }
+
+    for (int i = 0; i < nc; i++) {
+        contacts[i].surface.mode = dContactBounce; // Enable bounce
+        contacts[i].surface.bounce = 0.2;          // Bounce factor
+        contacts[i].surface.bounce_vel = 0.1;      // Minimum velocity for bounce
+        contacts[i].surface.mu = dInfinity;        // Friction coefficient
+
+        // Create a contact joint to handle the collision
+        dJointID c = dJointCreateContact(world, contactGroup, &contacts[i]);
+        dJointAttach(c, dGeomGetBody(o1), dGeomGetBody(o2));
+    }
+}
+
 static int AddBody(BodyType type, Vector3 pos, Vector3 size, char isKinematic) {
-    if (bodiesCount >= MAX_SHAPES) {
+    if (bodiesCount >= MAX_BODIES) {
         return -1;
     }
 
-    Body* shape = &bodies[bodiesCount];
-    shape->color = (Color){Rand_Int(70, 190), Rand_Int(70, 190), Rand_Int(70, 190), 255};
-    shape->type = type;
-    shape->size = size;
-    shape->body = dBodyCreate(world);
+    Body* body = &bodies[bodiesCount];
+    body->color = (Color){Rand_Int(70, 190), Rand_Int(70, 190), Rand_Int(70, 190), 255};
+    body->type = type;
+    body->size = size;
     switch (type) {
         case BODYTYPE_SPHERE: {
-            shape->geom = dCreateSphere(space, shape->size.x);
-            shape->display = LoadModelFromMesh(GenMeshSphere(shape->size.x, 10, 10));
+            body->geom = dCreateSphere(space, body->size.x);
+            body->display = LoadModelFromMesh(GenMeshSphere(body->size.x, 10, 10));
         } break;
         case BODYTYPE_BOX: {
-            shape->geom = dCreateBox(space, shape->size.x, shape->size.y, shape->size.z);
-            shape->display = LoadModelFromMesh(GenMeshCube(shape->size.x, shape->size.y, shape->size.z));
+            body->geom = dCreateBox(space, body->size.x, body->size.y, body->size.z);
+            body->display = LoadModelFromMesh(GenMeshCube(body->size.x, body->size.y, body->size.z));
         } break;
+        default: return -1;
     }
+    body->body = dBodyCreate(world);
 
-    dGeomSetBody(shape->geom, shape->body);
+    dGeomSetBody(body->geom, body->body);
 
-    dBodySetPosition(shape->body, pos.x, pos.y, pos.z);
+    dBodySetPosition(body->body, pos.x, pos.y, pos.z);
 
     if (isKinematic) {
         dBodySetKinematic(bodies[bodiesCount].body);
@@ -280,30 +308,44 @@ static int AddBody(BodyType type, Vector3 pos, Vector3 size, char isKinematic) {
     return bodiesCount++;
 }
 
-static void NearCallback(void* data, dGeomID o1, dGeomID o2) {
-    // Maximum number of contact points
-    const int MAX_CONTACTS = 8;
-    dContact contacts[MAX_CONTACTS];
-
-    // Check for collisions between o1 and o2
-    const int nc = dCollide(o1, o2, MAX_CONTACTS, &contacts[0].geom, sizeof(dContact));
-    if (nc <= 0) {
-        return;
+// use when stuff can be destroyed/freed, ode is better understood
+static int AddBodyTris(Model model, Vector3 pos, Vector3 size, char isKinematic) {
+    if (bodiesCount >= MAX_BODIES) {
+        return -1;
     }
 
-    for (int i = 0; i < nc; i++) {
-        contacts[i].surface.mode = dContactBounce; // Enable bounce
-        contacts[i].surface.bounce = 0.2;         // Bounce factor
-        contacts[i].surface.bounce_vel = 0.1;     // Minimum velocity for bounce
-        contacts[i].surface.mu = dInfinity;       // Friction coefficient
+    Body* body = &bodies[bodiesCount];
+    body->color = WHITE;
+    body->type = BODYTYPE_TRIMESH,
+    body->size = size;
+    body->display = model;
+    body->body = dBodyCreate(world);
 
-        // Create a contact joint to handle the collision
-        dJointID c = dJointCreateContact(world, contactGroup, &contacts[i]);
-        dJointAttach(c, dGeomGetBody(o1), dGeomGetBody(o2));
+    const int vertCount = model.meshes[0].vertexCount;
+    int* groundInd = malloc(vertCount * sizeof(int));
+    for (int i = 0; i < vertCount; i++) {
+        groundInd[i] = i;
     }
+
+    const dTriMeshDataID triData = dGeomTriMeshDataCreate();
+    dGeomTriMeshDataBuildSingle(triData, model.meshes[0].vertices,
+                                3 * sizeof(float), vertCount,
+                                groundInd, vertCount,
+                                3 * sizeof(int));
+    body->geom = dCreateTriMesh(space, triData, NULL, NULL, NULL);
+
+    dGeomSetBody(body->geom, body->body);
+
+    dBodySetPosition(body->body, pos.x, pos.y, pos.z);
+
+    if (isKinematic) {
+        dBodySetKinematic(bodies[bodiesCount].body);
+    }
+
+    return bodiesCount++;
 }
 
-RenderTexture LoadShadowmapRenderTexture(int width, int height) {
+static RenderTexture LoadShadowmapRenderTexture(int width, int height) {
     RenderTexture target = { 0 };
 
     target.id = rlLoadFramebuffer(); // Load an empty framebuffer
@@ -336,7 +378,7 @@ RenderTexture LoadShadowmapRenderTexture(int width, int height) {
 }
 
 // Unload shadowmap render texture from GPU memory (VRAM)
-void UnloadShadowmapRenderTexture(RenderTexture2D target) {
+static void UnloadShadowmapRenderTexture(RenderTexture2D target) {
     if (target.id > 0)
     {
         // NOTE: Depth texture/renderbuffer is automatically

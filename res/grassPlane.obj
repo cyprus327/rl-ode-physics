@@ -1,4 +1,4 @@
-mtllib grassPlane.mtl
+# mtllib grassPlane.mtl
 o Plane
 v -45.694511 0.184876 35.480789
 v 43.904945 -0.768302 40.214046

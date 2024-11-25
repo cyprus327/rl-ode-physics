@@ -1,3 +1,4 @@
+#include <ode/collision.h>
 #include <ode/objects.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,34 +14,42 @@
 
 #define MAX_PITCH (89.f * DEG2RAD)
 #define MAX_BODIES 512
+#define MAP_MAX_BODIES 64
 
-#define SHADOWMAP_RESOLUTION 1024
+// huge but I don't get how to make it not have to be
+#define SHADOWMAP_RESOLUTION 4096
 
 static Camera cam = { .position = {0.f, 2.f, -3.f}, .fovy = 90.f, .projection = CAMERA_PERSPECTIVE, .up = {0.f, 1.f, 0.f} };
 
 typedef enum bodyType {
+    BODYTYPE_NULL,
     BODYTYPE_SPHERE,
-    BODYTYPE_BOX,
-    BODYTYPE_TRIMESH
+    BODYTYPE_BOX
 } BodyType;
+
+typedef enum collMask {
+    CMASK_MAP    = 2,
+    CMASK_OBJECT = 4,
+    CMASK_ALL    = ~0
+} CollMask;
 
 typedef struct body {
     dBodyID body;
     dGeomID geom;
     BodyType type;
+    Vector3 pos, size;
     Model display;
-    Vector3 size;
     Color color;
 } Body;
 
 static Body bodies[MAX_BODIES];
-static i32 bodiesCount;
+static i32 bodiesCount = 0;
 
 static dWorldID world;
 static dSpaceID space;
 static dJointGroupID contactGroup;
 
-static Model floorModel;
+static Shader shadowShader;
 
 static u32 randState;
 
@@ -50,26 +59,34 @@ static f64 Rand_Double(f64 min, f64 max);
 
 static void HandleInput(Camera3D* camera, f32 moveSpeed, f32 turnSpeed, f32 dt);
 static void NearCallback(void* data, dGeomID o1, dGeomID o2);
-static i32 AddBody(BodyType type, Vector3 pos, Vector3 size, i8 isKinematic);
-static i32 AddBodyTris(Model model, Vector3 pos, Vector3 size, i8 isKinematic);
+static i32 AddBody(BodyType type, CollMask category, CollMask collide, Vector3 pos, Vector3 size, i8 isKinematic);
+static i32 AddBodyMap(Vector3 pos, Vector3 size);
+static void ReleaseBody(i32 id);
 
 // all shadowmap stuff copied from the raylib example shadowmap project
 static RenderTexture LoadShadowmapRenderTexture(i32 width, i32 height);
 static void UnloadShadowmapRenderTexture(RenderTexture2D target);
 
 static void DrawScene(void) {
-    DrawModel(floorModel, (Vector3){0.f, -0.5f, 0.f}, 1.f, WHITE);
-    for (i32 i = 0; i < bodiesCount; i++) {
-        const dReal* pos = dBodyGetPosition(bodies[i].body);
-        const dReal* rot = dBodyGetRotation(bodies[i].body);
-        bodies[i].display.transform = (Matrix){
-            rot[0], rot[1], rot[2], pos[0],
-            rot[4], rot[5], rot[6], pos[1],
-            rot[8], rot[9], rot[10], pos[2],
-            0.f, 0.f, 0.f, 1.f
-        };
+    for (i32 i = 0; i < MAX_BODIES; i++) {
+        if (bodies[i].type == BODYTYPE_NULL) {
+            continue;
+        }
 
-        DrawModel(bodies[i].display, (Vector3){0.f, 0.f, 0.f}, 1.f, bodies[i].color);
+        Vector3 drawPos = bodies[i].pos;
+        if (bodies[i].body) {
+            const dReal* pos = dBodyGetPosition(bodies[i].body);
+            const dReal* rot = dBodyGetRotation(bodies[i].body);
+            bodies[i].display.transform = (Matrix){
+                rot[0], rot[1], rot[2], pos[0],
+                rot[4], rot[5], rot[6], pos[1],
+                rot[8], rot[9], rot[10], pos[2],
+                0.f, 0.f, 0.f, 1.f
+            };
+            drawPos.x = drawPos.y = drawPos.z = 0.f;
+        }
+
+        DrawModel(bodies[i].display, drawPos, 1.f, bodies[i].color);
     }
 }
 
@@ -86,7 +103,11 @@ i32 main(void) {
 
     randState = (u32)time(NULL);
 
-    const Shader shadowShader = LoadShader("res/shadowMap.vert", "res/shadowMap.frag");
+    for (i32 i = 0; i < MAX_BODIES; i++) {
+        bodies[i].type = BODYTYPE_NULL;
+    }
+
+    shadowShader = LoadShader("res/shadowMap.vert", "res/shadowMap.frag");
     shadowShader.locs[SHADER_LOC_VECTOR_VIEW] = GetShaderLocation(shadowShader, "viewPos");
     const i32 lightDirLoc = GetShaderLocation(shadowShader, "lightDir");
     const i32 lightColLoc = GetShaderLocation(shadowShader, "lightColor");
@@ -112,22 +133,19 @@ i32 main(void) {
 
     Camera3D lightCam = (Camera3D){0};
     lightCam.target = Vector3Zero();
-    // Use an orthographic projection for directional lights
     lightCam.projection = CAMERA_ORTHOGRAPHIC;
     lightCam.up = (Vector3){ 0.0f, 1.0f, 0.0f };
-    lightCam.fovy = 90.0f;
+    lightCam.fovy = 250.0f;
 
     const Texture texture = LoadTexture("res/grassTexture.png");
     SetTextureFilter(texture, TEXTURE_FILTER_BILINEAR);
 
-    // works just messed up collisions
-    // const i32 body0 = AddBodyTris(LoadModel("res/grassPlane.obj"), (Vector3){0.f, 0.f, 0.f}, (Vector3){0.1f, 0.1f, 0.1f}, 1);
-    // bodies[body0].display.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = texture;
+    // const dGeomID floorID = dCreatePlane(space, 0, 1, 0, 0);
+    // floorModel = LoadModelFromMesh(GenMeshCube(100.f, 1.f, 100.f));
+    // floorModel.materials[0].shader = shadowShader;
+    // floorModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = texture;
 
-    const dGeomID floorID = dCreatePlane(space, 0, 1, 0, 0);
-    floorModel = LoadModelFromMesh(GenMeshCube(100.f, 1.f, 100.f));
-    floorModel.materials[0].shader = shadowShader;
-    floorModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = texture;
+    AddBodyMap((Vector3){0.f, 0.f, 0.f}, (Vector3){100.f, 1.f, 100.f});
 
     while (!WindowShouldClose()) {
         const f64 deltaTime = GetFrameTime();
@@ -149,41 +167,38 @@ i32 main(void) {
         if (IsKeyDown(KEY_DOWN) && lightDir.z > -0.6f) {
             lightDir.z -= cameraSpeed * 60.0f * deltaTime;
         }
-        if (IsKeyDown(KEY_N)) {
+        if (IsKeyDown(KEY_C)) {
             lightCam.fovy -= 30.f * deltaTime;
             printf("\tFOV: %f\n", lightCam.fovy);
         }
-        if (IsKeyDown(KEY_M)) {
+        if (IsKeyDown(KEY_V)) {
             lightCam.fovy += 30.f * deltaTime;
             printf("\tFOV: %f\n", lightCam.fovy);
         }
         lightDir = Vector3Normalize(lightDir);
-        lightCam.position = Vector3Scale(lightDir, -20.0f);
+        lightCam.position = Vector3Scale(lightDir, -200.0f);
         SetShaderValue(shadowShader, lightDirLoc, &lightDir, SHADER_UNIFORM_VEC3);
 
         static f32 spawnTimer = 0.f;
         spawnTimer += deltaTime;
-        if (spawnTimer > 0.05f && bodiesCount < MAX_BODIES / 2) {
+        if (IsKeyDown(KEY_M) && spawnTimer > 0.05f && bodiesCount < MAX_BODIES / 2) {
             spawnTimer = 0.0f;
-
             const Vector3 pos = {Rand_Double(-4.0, 4.0), Rand_Double(20.0, 50.0), Rand_Double(-4.0, 4.0)};
             i32 added;
             switch (Rand_Int(0, 2)) {
-                case BODYTYPE_BOX: {
-                    added = AddBody(BODYTYPE_BOX, pos, (Vector3){Rand_Double(0.2, 1.0), Rand_Double(0.2, 1.0), Rand_Double(0.2, 1.0)}, 0);
+                case 0: {
+                    added = AddBody(BODYTYPE_BOX, CMASK_OBJECT, CMASK_ALL, pos, (Vector3){Rand_Double(0.2, 1.0), Rand_Double(0.2, 1.0), Rand_Double(0.2, 1.0)}, 0);
                 } break;
-                case BODYTYPE_SPHERE: {
-                    added = AddBody(BODYTYPE_SPHERE, pos, (Vector3){Rand_Double(0.1, 0.4), 0.f, 0.f}, 0);
+                case 1: {
+                    added = AddBody(BODYTYPE_SPHERE, CMASK_OBJECT, CMASK_ALL, pos, (Vector3){Rand_Double(0.1, 0.4), 0.f, 0.f}, 0);
                 } break;
             }
-            bodies[added].display.materials[0].shader = shadowShader;
         }
 
         if (IsKeyReleased(KEY_SPACE) && bodiesCount < MAX_BODIES) {
             const Vector3 d = Vector3Normalize(Vector3Subtract(cam.target, cam.position));
-            const i32 ball = AddBody(BODYTYPE_SPHERE, camPos, (Vector3){0.15f, 0.f, 0.f}, 0);
+            const i32 ball = AddBody(BODYTYPE_SPHERE, CMASK_OBJECT, CMASK_OBJECT | CMASK_MAP, camPos, (Vector3){0.15f, 0.f, 0.f}, 0);
             dBodyAddForce(bodies[ball].body, d.x * 10000.f, d.y * 10000.f, d.z * 10000.f);
-            printf("D: %f %f %f\n", d.x, d.y, d.z);
         }
 
         dSpaceCollide(space, NULL, NearCallback);
@@ -200,8 +215,6 @@ i32 main(void) {
         EndMode3D();
         EndTextureMode();
 
-        ClearBackground(DARKGRAY);
-
         const Matrix lightViewProj = MatrixMultiply(lightView, lightProj);
         SetShaderValueMatrix(shadowShader, lightVPLoc, lightViewProj);
 
@@ -211,38 +224,45 @@ i32 main(void) {
         rlEnableTexture(shadowMap.depth.id);
         rlSetUniform(shadowMapLoc, &slot, SHADER_UNIFORM_INT, 1);
 
+        ClearBackground(DARKGRAY);
         BeginMode3D(cam);
             if (IsKeyDown(KEY_X)) {
-                DrawModel(floorModel, (Vector3){0.f, -0.5f, 0.f}, 1.f, WHITE);
                 for (i32 i = 0; i < bodiesCount; i++) {
-                    const dReal* pos = dBodyGetPosition(bodies[i].body);
-                    const dReal* rot = dBodyGetRotation(bodies[i].body);
-                    const f32 transform[16] = {
-                        rot[0], rot[4], rot[8],  0.0f,
-                        rot[1], rot[5], rot[9],  0.0f,
-                        rot[2], rot[6], rot[10], 0.0f,
-                        pos[0], pos[1], pos[2],  1.0f
-                    };
+                    if (bodies[i].type == BODYTYPE_NULL) {
+                        continue;
+                    }
 
-                    rlPushMatrix();
-                    rlMultMatrixf(transform);
+                    Vector3 drawPos = bodies[i].pos;
+                    if (bodies[i].body) {
+                        const dReal*pos = dBodyGetPosition(bodies[i].body);
+                        const dReal*rot = dBodyGetRotation(bodies[i].body);
+                        const f32 transform[16] = {
+                            rot[0], rot[4], rot[8],  0.0f,
+                            rot[1], rot[5], rot[9],  0.0f,
+                            rot[2], rot[6], rot[10], 0.0f,
+                            pos[0], pos[1], pos[2],  1.0f
+                        };
+                        drawPos.x = drawPos.y = drawPos.z = 0.f;
+                        rlPushMatrix();
+                        rlMultMatrixf(transform);
+                    }
 
                     switch (bodies[i].type) {
+                        case BODYTYPE_NULL: break; // obviously can't happen just to make lsp happy
                         case BODYTYPE_SPHERE: {
                             const f32 radius = dGeomSphereGetRadius(bodies[i].geom);
-                            DrawSphereWires((Vector3){0.f, 0.f, 0.f}, radius, 12, 12, MAGENTA);
+                            DrawSphereWires(drawPos, radius, 12, 12, MAGENTA);
                         } break;
                         case BODYTYPE_BOX: {
                             dVector3 sides;
                             dGeomBoxGetLengths(bodies[i].geom, sides);
-                            DrawCubeWires((Vector3){0.f, 0.f, 0.f}, sides[0], sides[1], sides[2], MAGENTA);
-                        } break;
-                        case BODYTYPE_TRIMESH: {
-                            DrawModelWires(bodies[i].display, (Vector3){0.f, 0.f, 0.f}, 1.f, MAGENTA);
+                            DrawCubeWires(drawPos, sides[0], sides[1], sides[2], MAGENTA);
                         } break;
                     }
 
-                    rlPopMatrix();
+                    if (bodies[i].body) {
+                        rlPopMatrix();
+                    }
                 }
             } else {
                 DrawScene();
@@ -257,13 +277,11 @@ i32 main(void) {
         EndDrawing();
     }
 
-    for (i32 i = 0; i < bodiesCount; i++) {
-        dBodyDestroy(bodies[i].body);
-        dGeomDestroy(bodies[i].geom);
-        UnloadModel(bodies[i].display);
+    for (i32 i = 0; i < MAX_BODIES; i++) {
+        if (bodies[i].type != BODYTYPE_NULL) {
+            ReleaseBody(i);
+        }
     }
-    dGeomDestroy(floorID);
-    UnloadModel(floorModel);
     dJointGroupDestroy(contactGroup);
     dWorldDestroy(world);
     dCloseODE();
@@ -293,74 +311,95 @@ static void NearCallback(void* data, dGeomID o1, dGeomID o2) {
     }
 }
 
-static i32 AddBody(BodyType type, Vector3 pos, Vector3 size, i8 isKinematic) {
+static i32 AddBody(BodyType type, CollMask category, CollMask collide, Vector3 pos, Vector3 size, i8 isKinematic) {
     if (bodiesCount >= MAX_BODIES) {
         return -1;
     }
 
-    Body* body = &bodies[bodiesCount];
-    body->color = (Color){Rand_Int(70, 190), Rand_Int(70, 190), Rand_Int(70, 190), 255};
-    body->type = type;
-    body->size = size;
-    switch (type) {
-        case BODYTYPE_SPHERE: {
-            body->geom = dCreateSphere(space, body->size.x);
-            body->display = LoadModelFromMesh(GenMeshSphere(body->size.x, 10, 10));
-        } break;
-        case BODYTYPE_BOX: {
-            body->geom = dCreateBox(space, body->size.x, body->size.y, body->size.z);
-            body->display = LoadModelFromMesh(GenMeshCube(body->size.x, body->size.y, body->size.z));
-        } break;
-        default: return -1;
+    for (i32 i = 0; i < MAX_BODIES; i++) {
+        if (bodies[i].type != BODYTYPE_NULL) {
+            continue;
+        }
+
+        Body* body = &bodies[i];
+        body->color = (Color){Rand_Int(70, 190), Rand_Int(70, 190), Rand_Int(70, 190), 255};
+        body->type = type;
+        // body->categoryBity = category;
+        // body->collideBits = collide;
+        body->size = size;
+        switch (type) {
+            case BODYTYPE_SPHERE: {
+                body->geom = dCreateSphere(space, size.x);
+                body->display = LoadModelFromMesh(GenMeshSphere(size.x, 10, 10));
+            } break;
+            case BODYTYPE_BOX: {
+                body->geom = dCreateBox(space, size.x, size.y, size.z);
+                body->display = LoadModelFromMesh(GenMeshCube(size.x, size.y, size.z));
+            } break;
+            default: return -1;
+        }
+        body->display.materials[0].shader = shadowShader;
+        dGeomSetCategoryBits(body->geom, category);
+        dGeomSetCollideBits(body->geom, collide);
+
+        body->body = dBodyCreate(world);
+        dBodySetPosition(body->body, pos.x, pos.y, pos.z);
+        dGeomSetBody(body->geom, body->body);
+
+        if (isKinematic) {
+            dBodySetKinematic(body->body);
+        }
+
+        bodiesCount++;
+        return i;
     }
-    body->body = dBodyCreate(world);
 
-    dGeomSetBody(body->geom, body->body);
-
-    dBodySetPosition(body->body, pos.x, pos.y, pos.z);
-
-    if (isKinematic) {
-        dBodySetKinematic(bodies[bodiesCount].body);
-    }
-
-    return bodiesCount++;
+    return -1;
 }
 
-// use when stuff can be destroyed/freed, ode is better understood
-static i32 AddBodyTris(Model model, Vector3 pos, Vector3 size, i8 isKinematic) {
-    if (bodiesCount >= MAX_BODIES) {
+static i32 AddBodyMap(Vector3 pos, Vector3 size) {
+    if (bodiesCount >= MAP_MAX_BODIES) {
         return -1;
     }
 
-    Body* body = &bodies[bodiesCount];
-    body->color = WHITE;
-    body->type = BODYTYPE_TRIMESH,
-    body->size = size;
-    body->display = model;
-    body->body = dBodyCreate(world);
+    for (i32 i = 0; i < MAX_BODIES; i++) {
+        if (bodies[i].type != BODYTYPE_NULL) {
+            continue;
+        }
 
-    const i32 vertCount = model.meshes[0].vertexCount;
-    i32* groundInd = malloc(vertCount * sizeof(i32));
-    for (i32 i = 0; i < vertCount; i++) {
-        groundInd[i] = i;
+        Body* body = &bodies[i];
+        body->color = (Color){Rand_Int(10, 30), Rand_Int(10, 30), Rand_Int(10, 30), 255};
+        body->type = BODYTYPE_BOX;
+        body->size = size;
+        body->display = LoadModelFromMesh(GenMeshCube(size.x, size.y, size.z));
+        body->display.materials[0].shader = shadowShader;
+        body->geom = dCreateBox(space, size.x, size.y, size.x);
+        dGeomSetCategoryBits(body->geom, CMASK_MAP);
+        dGeomSetCategoryBits(body->geom, CMASK_ALL & ~CMASK_MAP);
+        body->body = NULL;
+        // body->body = dBodyCreate(world);
+        // dBodySetPosition(body->body, pos.x, pos.y, pos.z);
+        // dGeomSetBody(body->geom, body->body);
+        // dBodySetKinematic(body->body);
+
+        bodiesCount++;
+        return i;
     }
 
-    const dTriMeshDataID triData = dGeomTriMeshDataCreate();
-    dGeomTriMeshDataBuildSingle(triData, model.meshes[0].vertices,
-                                3 * sizeof(f32), vertCount,
-                                groundInd, vertCount,
-                                3 * sizeof(i32));
-    body->geom = dCreateTriMesh(space, triData, NULL, NULL, NULL);
+    return -1;
+}
 
-    dGeomSetBody(body->geom, body->body);
-
-    dBodySetPosition(body->body, pos.x, pos.y, pos.z);
-
-    if (isKinematic) {
-        dBodySetKinematic(bodies[bodiesCount].body);
+static void ReleaseBody(i32 id) {
+    if (bodies[id].type == BODYTYPE_NULL) {
+        return;
     }
 
-    return bodiesCount++;
+    bodies[id].type = BODYTYPE_NULL;
+    if (bodies[id].body) {
+        dBodyDestroy(bodies[id].body);
+    }
+    dGeomDestroy(bodies[id].geom);
+    UnloadModel(bodies[id].display);
 }
 
 static RenderTexture LoadShadowmapRenderTexture(i32 width, i32 height) {
@@ -397,8 +436,7 @@ static RenderTexture LoadShadowmapRenderTexture(i32 width, i32 height) {
 
 // Unload shadowmap render texture from GPU memory (VRAM)
 static void UnloadShadowmapRenderTexture(RenderTexture2D target) {
-    if (target.id > 0)
-    {
+    if (target.id > 0) {
         // NOTE: Depth texture/renderbuffer is automatically
         // queried and deleted before deleting framebuffer
         rlUnloadFramebuffer(target.id);
@@ -451,9 +489,9 @@ static void HandleInput(Camera3D* camera, f32 moveSpeed, f32 turnSpeed, f32 dt) 
 
 u32 Rand_Next(void) {
     randState += 0xE120FC15;
-    unsigned long long temp = (unsigned long long)randState * 0x4A39B70D;
+    u64 temp = (u64)randState * 0x4A39B70D;
     const u32 m1 = (u32)((temp >> 32) ^ temp);
-    temp = (unsigned long long)m1 * 0x12FAD5C9;
+    temp = (u64)m1 * 0x12FAD5C9;
     return (u32)((temp >> 32) ^ temp);
 }
 

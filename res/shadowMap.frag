@@ -41,9 +41,11 @@ void main() {
     float NdotL = max(dot(normal, l), 0.0);
     lightDot += lightColor.rgb * NdotL;
 
+    // ignore for now
     float specCo = 0.0;
-    if (NdotL > 0.0) specCo = pow(max(0.0, dot(viewD, reflect(-(l), normal))), 16.0); // 16 refers to shine
-    specular += specCo;
+    if (NdotL > 0.0) specCo = pow(max(0.0, dot(viewD, reflect(-(l), normal))), 8.0); // 8 refers to shine
+    specular += specCo / 2;
+    // specular += 1.0 - 2.0 * ambient.x;
 
     finalColor = (texelColor * ((colDiffuse + vec4(specular, 1.0)) * vec4(lightDot, 1.0)));
 

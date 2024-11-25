@@ -16,8 +16,7 @@
 #define MAX_BODIES 512
 #define MAP_MAX_BODIES 64
 
-// huge but I don't get how to make it not have to be
-#define SHADOWMAP_RESOLUTION 4096
+#define SHADOWMAP_RESOLUTION 2048
 
 static Camera cam = { .position = {0.f, 2.f, -3.f}, .fovy = 90.f, .projection = CAMERA_PERSPECTIVE, .up = {0.f, 1.f, 0.f} };
 
@@ -37,7 +36,7 @@ typedef struct body {
     dBodyID body;
     dGeomID geom;
     BodyType type;
-    Vector3 pos, size;
+    Vector3 size;
     Model display;
     Color color;
 } Body;
@@ -60,7 +59,7 @@ static f64 Rand_Double(f64 min, f64 max);
 static void HandleInput(Camera3D* camera, f32 moveSpeed, f32 turnSpeed, f32 dt);
 static void NearCallback(void* data, dGeomID o1, dGeomID o2);
 static i32 AddBody(BodyType type, CollMask category, CollMask collide, Vector3 pos, Vector3 size, i8 isKinematic);
-static i32 AddBodyMap(Vector3 pos, Vector3 size);
+static i32 AddBodyMap(Vector3 pos, Vector3 rot, Vector3 size);
 static void ReleaseBody(i32 id);
 
 // all shadowmap stuff copied from the raylib example shadowmap project
@@ -73,20 +72,24 @@ static void DrawScene(void) {
             continue;
         }
 
-        Vector3 drawPos = bodies[i].pos;
+        const dReal* pos;
+        const dReal* rot;
         if (bodies[i].body) {
-            const dReal* pos = dBodyGetPosition(bodies[i].body);
-            const dReal* rot = dBodyGetRotation(bodies[i].body);
-            bodies[i].display.transform = (Matrix){
-                rot[0], rot[1], rot[2], pos[0],
-                rot[4], rot[5], rot[6], pos[1],
-                rot[8], rot[9], rot[10], pos[2],
-                0.f, 0.f, 0.f, 1.f
-            };
-            drawPos.x = drawPos.y = drawPos.z = 0.f;
+            pos = dBodyGetPosition(bodies[i].body);
+            rot = dBodyGetRotation(bodies[i].body);
+        } else {
+            pos = dGeomGetPosition(bodies[i].geom);
+            rot = dGeomGetRotation(bodies[i].geom);
         }
 
-        DrawModel(bodies[i].display, drawPos, 1.f, bodies[i].color);
+        bodies[i].display.transform = (Matrix){
+            rot[0], rot[1], rot[2], pos[0],
+            rot[4], rot[5], rot[6], pos[1],
+            rot[8], rot[9], rot[10], pos[2],
+            0.f, 0.f, 0.f, 1.f
+        };
+
+        DrawModel(bodies[i].display, (Vector3){0.f, 0.f, 0.f}, 1.f, bodies[i].color);
     }
 }
 
@@ -135,17 +138,18 @@ i32 main(void) {
     lightCam.target = Vector3Zero();
     lightCam.projection = CAMERA_ORTHOGRAPHIC;
     lightCam.up = (Vector3){ 0.0f, 1.0f, 0.0f };
-    lightCam.fovy = 250.0f;
+    lightCam.fovy = 200.0f;
 
     const Texture texture = LoadTexture("res/grassTexture.png");
     SetTextureFilter(texture, TEXTURE_FILTER_BILINEAR);
 
-    // const dGeomID floorID = dCreatePlane(space, 0, 1, 0, 0);
-    // floorModel = LoadModelFromMesh(GenMeshCube(100.f, 1.f, 100.f));
-    // floorModel.materials[0].shader = shadowShader;
-    // floorModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = texture;
-
-    AddBodyMap((Vector3){0.f, 0.f, 0.f}, (Vector3){100.f, 1.f, 100.f});
+    const i32 mainFloor = AddBodyMap((Vector3){0.f, 0.f, 0.f}, (Vector3){0.f, 0.f, 0.f}, (Vector3){100.f, 1.f, 100.f});
+    bodies[mainFloor].display.materials->maps[MATERIAL_MAP_DIFFUSE].texture = texture;
+    // AddBodyMap((Vector3){5.f, 3.f, 0.f}, (Vector3){0.0, 0.0, -0.8}, (Vector3){1.f, 10.f, 8.f});
+    AddBodyMap((Vector3){6.f, 3.f, 0.f}, (Vector3){0.f, 0.f, 0.f}, (Vector3){0.5f, 8.f, 12.f});
+    AddBodyMap((Vector3){-6.f, 3.f, 0.f}, (Vector3){0.f, 0.f, 0.f}, (Vector3){0.5f, 8.f, 12.f});
+    AddBodyMap((Vector3){0.f, 3.f, 6.f}, (Vector3){0.f, 0.f, 0.f}, (Vector3){12.f, 8.f, 0.5f});
+    AddBodyMap((Vector3){0.f, 3.f, -6.f}, (Vector3){0.f, 0.f, 0.f}, (Vector3){12.f, 8.f, 0.5f});
 
     while (!WindowShouldClose()) {
         const f64 deltaTime = GetFrameTime();
@@ -232,37 +236,40 @@ i32 main(void) {
                         continue;
                     }
 
-                    Vector3 drawPos = bodies[i].pos;
+                    const dReal* pos;
+                    const dReal* rot;
                     if (bodies[i].body) {
-                        const dReal*pos = dBodyGetPosition(bodies[i].body);
-                        const dReal*rot = dBodyGetRotation(bodies[i].body);
-                        const f32 transform[16] = {
-                            rot[0], rot[4], rot[8],  0.0f,
-                            rot[1], rot[5], rot[9],  0.0f,
-                            rot[2], rot[6], rot[10], 0.0f,
-                            pos[0], pos[1], pos[2],  1.0f
-                        };
-                        drawPos.x = drawPos.y = drawPos.z = 0.f;
-                        rlPushMatrix();
-                        rlMultMatrixf(transform);
+                        pos = dBodyGetPosition(bodies[i].body);
+                        rot = dBodyGetRotation(bodies[i].body);
+                    } else {
+                        pos = dGeomGetPosition(bodies[i].geom);
+                        rot = dGeomGetRotation(bodies[i].geom);
                     }
+
+                    const f32 transform[16] = {
+                        rot[0], rot[4], rot[8],  0.0f,
+                        rot[1], rot[5], rot[9],  0.0f,
+                        rot[2], rot[6], rot[10], 0.0f,
+                        pos[0], pos[1], pos[2],  1.0f
+                    };
+
+                    rlPushMatrix();
+                    rlMultMatrixf(transform);
 
                     switch (bodies[i].type) {
                         case BODYTYPE_NULL: break; // obviously can't happen just to make lsp happy
                         case BODYTYPE_SPHERE: {
                             const f32 radius = dGeomSphereGetRadius(bodies[i].geom);
-                            DrawSphereWires(drawPos, radius, 12, 12, MAGENTA);
+                            DrawSphereWires((Vector3){0.f, 0.f, 0.f}, radius, 12, 12, MAGENTA);
                         } break;
                         case BODYTYPE_BOX: {
                             dVector3 sides;
                             dGeomBoxGetLengths(bodies[i].geom, sides);
-                            DrawCubeWires(drawPos, sides[0], sides[1], sides[2], MAGENTA);
+                            DrawCubeWires((Vector3){0.f, 0.f, 0.f}, sides[0], sides[1], sides[2], MAGENTA);
                         } break;
                     }
 
-                    if (bodies[i].body) {
-                        rlPopMatrix();
-                    }
+                    rlPopMatrix();
                 }
             } else {
                 DrawScene();
@@ -324,13 +331,18 @@ static i32 AddBody(BodyType type, CollMask category, CollMask collide, Vector3 p
         Body* body = &bodies[i];
         body->color = (Color){Rand_Int(70, 190), Rand_Int(70, 190), Rand_Int(70, 190), 255};
         body->type = type;
-        // body->categoryBity = category;
-        // body->collideBits = collide;
         body->size = size;
+
+        body->body = dBodyCreate(world);
+        dBodySetPosition(body->body, pos.x, pos.y, pos.z);
+        if (isKinematic) {
+            dBodySetKinematic(body->body);
+        }
+
         switch (type) {
             case BODYTYPE_SPHERE: {
                 body->geom = dCreateSphere(space, size.x);
-                body->display = LoadModelFromMesh(GenMeshSphere(size.x, 10, 10));
+                body->display = LoadModelFromMesh(GenMeshSphere(size.x, 18, 18));
             } break;
             case BODYTYPE_BOX: {
                 body->geom = dCreateBox(space, size.x, size.y, size.z);
@@ -341,14 +353,7 @@ static i32 AddBody(BodyType type, CollMask category, CollMask collide, Vector3 p
         body->display.materials[0].shader = shadowShader;
         dGeomSetCategoryBits(body->geom, category);
         dGeomSetCollideBits(body->geom, collide);
-
-        body->body = dBodyCreate(world);
-        dBodySetPosition(body->body, pos.x, pos.y, pos.z);
         dGeomSetBody(body->geom, body->body);
-
-        if (isKinematic) {
-            dBodySetKinematic(body->body);
-        }
 
         bodiesCount++;
         return i;
@@ -357,7 +362,7 @@ static i32 AddBody(BodyType type, CollMask category, CollMask collide, Vector3 p
     return -1;
 }
 
-static i32 AddBodyMap(Vector3 pos, Vector3 size) {
+static i32 AddBodyMap(Vector3 pos, Vector3 rot, Vector3 size) {
     if (bodiesCount >= MAP_MAX_BODIES) {
         return -1;
     }
@@ -373,7 +378,35 @@ static i32 AddBodyMap(Vector3 pos, Vector3 size) {
         body->size = size;
         body->display = LoadModelFromMesh(GenMeshCube(size.x, size.y, size.z));
         body->display.materials[0].shader = shadowShader;
-        body->geom = dCreateBox(space, size.x, size.y, size.x);
+        body->geom = dCreateBox(space, size.x, size.y, size.z);
+
+        const dReal cx = cos(rot.x);
+        const dReal sx = sin(rot.x);
+        const dReal cy = cos(rot.y);
+        const dReal sy = sin(rot.y);
+        const dReal cz = cos(rot.z);
+        const dReal sz = sin(rot.z);
+        dReal rm[16] = {
+            cy * cz,
+            cz * sx * sy - cx * sz,
+            cx * cz * sy + sx * sz,
+            0,
+
+            cy * sz,
+            cx * cz + sx * sy * sz,
+            -cz * sx + cx * sy * sx,
+            0,
+
+            -sy,
+            cy * sx,
+            cx * cy,
+            0,
+
+            0, 0, 0, 1
+        };
+        dGeomSetRotation(body->geom, rm);
+        dGeomSetPosition(body->geom, pos.x, pos.y, pos.z);
+
         dGeomSetCategoryBits(body->geom, CMASK_MAP);
         dGeomSetCategoryBits(body->geom, CMASK_ALL & ~CMASK_MAP);
         body->body = NULL;

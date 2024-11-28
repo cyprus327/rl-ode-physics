@@ -1,70 +1,111 @@
 #include <stdio.h>
+#include <string.h>
 
-#define ENET_IMPLEMENTATION
-#include "../inc/enet.h"
+#include <enet/enet.h>
 
-int main() {
-    if (enet_initialize () != 0) {
-        printf("An error occurred while initializing ENet.\n");
-        return 1;
+#include "../inc/util.h"
+#include "../inc/msgs.h"
+#include "../inc/player.h"
+
+typedef struct peerInfo {
+    ENetPeer* peer;
+    i32 playerID;
+} PeerInfo;
+
+static PeerInfo peerInfo[MAX_PLAYERS];
+
+i32 main() {
+    if (enet_initialize() != 0) {
+        fprintf(stderr, "An error occurred while initializing ENet.\n");
+        return EXIT_FAILURE;
     }
 
-    ENetAddress address = {0};
-
-    address.host = ENET_HOST_ANY; /* Bind the server to the default localhost.     */
-    address.port = 7777; /* Bind the server to port 7777. */
-
-    #define MAX_CLIENTS 32
-
-    /* create a server */
-    ENetHost * server = enet_host_create(&address, MAX_CLIENTS, 2, 0, 0);
-
+    ENetAddress address = { .host = ENET_HOST_ANY, .port = 12345 };
+    ENetHost* server = enet_host_create(&address, MAX_PLAYERS, 2, 0, 0);
     if (server == NULL) {
-        printf("An error occurred while trying to create an ENet server host.\n");
-        return 1;
+        fprintf(stderr, "An error occurred while trying to create the server.\n");
+        return EXIT_FAILURE;
     }
 
-    printf("Started a server...\n");
+    for (i32 i = 0; i < MAX_PLAYERS; i++) {
+        peerInfo[i].peer = NULL;
+        players[i].id = peerInfo[i].playerID = -1;
+        players[i].pos.x = players[i].pos.y = players[i].dir.x = players[i].dir.y = 0.f;
+    }
+
+    printf("Server started on port %d\n", address.port);
 
     ENetEvent event;
+    while (1) {
+        while (enet_host_service(server, &event, 16) > 0) {
+            u8 playerUpdated = 0;
+            switch (event.type) {
+                case ENET_EVENT_TYPE_CONNECT: {
+                    printf("A new client connected.\n");
+                    u8 foundEmpty = 0;
+                    for (i32 i = 0; i < MAX_PLAYERS; i++) {
+                        if (players[i].id != -1) {
+                            continue;
+                        }
 
-    /* Wait up to 10000 milliseconds for an event. (WARNING: blocking) */
-    while (enet_host_service(server, &event, 10000) > 0) {
-        switch (event.type) {
-            case ENET_EVENT_TYPE_CONNECT:
-                printf("A new client connected from %x:%u.\n", event.peer->address.host, event.peer->address.port);
-                /* Store any relevant client information here. */
-                event.peer->data = "Client information";
-                break;
+                        players[i].id = i;
+                        players[i].pos = players[i].dir = (Vector3){0.f, 0.f, 0.f};
+                        peerInfo[i].playerID = i;
+                        peerInfo[i].peer = event.peer;
 
-            case ENET_EVENT_TYPE_RECEIVE:
-                printf("A packet of length %lu containing %s was received from %s on channel %u.\n",
-                        event.packet->dataLength,
-                        event.packet->data,
-                        (char*)event.peer->data,
-                        event.channelID);
-                /* Clean up the packet now that we're done using it. */
-                enet_packet_destroy (event.packet);
-                break;
+                        MsgPlayerID idMsg = { .type = MSGTYPE_C_PLAYER_ID, .playerID = i };
+                        ENetPacket* packet = enet_packet_create(&idMsg, sizeof(MsgPlayerID), ENET_PACKET_FLAG_RELIABLE);
+                        enet_peer_send(event.peer, 0, packet);
+                        playerUpdated = 1;
 
-            case ENET_EVENT_TYPE_DISCONNECT:
-                printf("%s disconnected.\n", (char*)event.peer->data);
-                /* Reset the peer's client information. */
-                event.peer->data = NULL;
-                break;
+                        printf("Assigned player ID: %d\n", i);
+                        foundEmpty = 1;
+                        break;
+                    }
+                    if (!foundEmpty) {
+                        enet_peer_disconnect(event.peer, 0);
+                    }
+                } break;
+                case ENET_EVENT_TYPE_RECEIVE: {
+                    switch (*(MsgType*)event.packet->data) {
+                        case MSGTYPE_S_PLAYER_UPDATE: {
+                            MsgPlayerState* player = (MsgPlayerState*)event.packet->data;
+                            players[player->player.id] = player->player;
+                            playerUpdated = 1;
+                        } break;
+                        default: {
+                            TraceLog(LOG_WARNING, TextFormat("Received unknown message of length %d", event.packet->dataLength));
+                        } break;
+                    }
+                    enet_packet_destroy(event.packet);
+                } break;
+                case ENET_EVENT_TYPE_DISCONNECT: {
+                    for (i32 i = 0; i < MAX_PLAYERS; i++) {
+                        if (event.peer != peerInfo[i].peer) {
+                            continue;
+                        }
 
-            case ENET_EVENT_TYPE_DISCONNECT_TIMEOUT:
-                printf("%s disconnected due to timeout.\n", (char*)event.peer->data);
-                /* Reset the peer's client information. */
-                event.peer->data = NULL;
-                break;
+                        players[i].id = -1;
+                        peerInfo[i].playerID = -1;
+                        peerInfo[i].peer = NULL;
+                        playerUpdated = 1;
+                        printf("A client disconnected (ID: %d)\n", i);
+                        break;
+                    }
+                } break;
+                default: break;
+            }
 
-            case ENET_EVENT_TYPE_NONE:
-                break;
+            if (playerUpdated) {
+                MsgUpdatePlayers updatedPlayers = { .type = MSGTYPE_C_UPDATE_PLAYERS };
+                memcpy(updatedPlayers.players, players, sizeof(players));
+                ENetPacket* packet = enet_packet_create(&updatedPlayers, sizeof(MsgUpdatePlayers), ENET_PACKET_FLAG_RELIABLE);
+                enet_host_broadcast(server, 0, packet);
+            }
         }
     }
 
     enet_host_destroy(server);
     enet_deinitialize();
-    return 0;
+    return EXIT_SUCCESS;
 }

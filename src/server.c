@@ -37,7 +37,7 @@ i32 main() {
 
     ENetEvent event;
     while (1) {
-        while (enet_host_service(server, &event, 16) > 0) {
+        while (enet_host_service(server, &event, 1000) > 0) {
             u8 playerUpdated = 0;
             switch (event.type) {
                 case ENET_EVENT_TYPE_CONNECT: {
@@ -53,7 +53,7 @@ i32 main() {
                         peerInfo[i].playerID = i;
                         peerInfo[i].peer = event.peer;
 
-                        MsgPlayerID idMsg = { .type = MSGTYPE_C_PLAYER_ID, .playerID = i };
+                        MsgPlayerID idMsg = { .msg = MSGTYPE_C_PLAYER_ID, .playerID = i };
                         ENetPacket* packet = enet_packet_create(&idMsg, sizeof(MsgPlayerID), ENET_PACKET_FLAG_RELIABLE);
                         enet_peer_send(event.peer, 0, packet);
                         playerUpdated = 1;
@@ -69,7 +69,7 @@ i32 main() {
                 case ENET_EVENT_TYPE_RECEIVE: {
                     switch (*(MsgType*)event.packet->data) {
                         case MSGTYPE_S_PLAYER_UPDATE: {
-                            MsgPlayerState* player = (MsgPlayerState*)event.packet->data;
+                            MsgPlayerUpdate* player = (MsgPlayerUpdate*)event.packet->data;
                             players[player->player.id] = player->player;
                             playerUpdated = 1;
                         } break;
@@ -97,7 +97,7 @@ i32 main() {
             }
 
             if (playerUpdated) {
-                MsgUpdatePlayers updatedPlayers = { .type = MSGTYPE_C_UPDATE_PLAYERS };
+                MsgUpdatePlayers updatedPlayers = { .msg = MSGTYPE_C_UPDATE_PLAYERS };
                 memcpy(updatedPlayers.players, players, sizeof(players));
                 ENetPacket* packet = enet_packet_create(&updatedPlayers, sizeof(MsgUpdatePlayers), ENET_PACKET_FLAG_RELIABLE);
                 enet_host_broadcast(server, 0, packet);

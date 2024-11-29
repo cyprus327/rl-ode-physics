@@ -44,7 +44,7 @@ i32 main() {
 
     while (!WindowShouldClose()) {
         ENetEvent event;
-        while (enet_host_service(client, &event, 16) > 0) {
+        while (enet_host_service(client, &event, 0) > 0) {
             switch (event.type) {
                 case ENET_EVENT_TYPE_RECEIVE: {
                     switch (*(MsgType*)event.packet->data) {
@@ -89,8 +89,8 @@ i32 main() {
 
             localPlayer->dir.x += (IsKeyDown(KEY_LEFT) ? -turnSpeed : 0.f) + (IsKeyDown(KEY_RIGHT) ? turnSpeed : 0.f);
 
-            MsgPlayerState msg = { .type = MSGTYPE_S_PLAYER_UPDATE, .player = *localPlayer };
-            ENetPacket *packet = enet_packet_create(&msg, sizeof(MsgPlayerState), ENET_PACKET_FLAG_RELIABLE);
+            MsgPlayerUpdate msg = { .msg = MSGTYPE_S_PLAYER_UPDATE, .player = *localPlayer };
+            ENetPacket *packet = enet_packet_create(&msg, sizeof(MsgPlayerUpdate), ENET_PACKET_FLAG_RELIABLE);
             enet_peer_send(peer, 0, packet);
         }
 

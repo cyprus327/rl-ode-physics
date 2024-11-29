@@ -1,16 +1,22 @@
-#include <ode/collision.h>
-#include <ode/objects.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
 
 #include "raylib.h"
 #include "raymath.h"
 #include "rlgl.h"
-
+#define RAYGUI_IMPLEMENTATION
+#include "../inc/raygui.h"
 #include "ode/ode.h"
+#include "enet/enet.h"
 
 #include "../inc/util.h" // shouldn't have to do this but zed sucks for some reason
+#include "../inc/rand.h"
+#include "../inc/msgs.h"
+#include "../inc/player.h"
 
 #define MAX_PITCH (89.f * DEG2RAD)
 #define MAX_BODIES 512
@@ -18,31 +24,15 @@
 
 #define SHADOWMAP_RESOLUTION 2048
 
-static Camera cam = { .position = {0.f, 2.f, -3.f}, .fovy = 90.f, .projection = CAMERA_PERSPECTIVE, .up = {0.f, 1.f, 0.f} };
-
-typedef enum bodyType {
-    BODYTYPE_NULL,
-    BODYTYPE_SPHERE,
-    BODYTYPE_BOX
-} BodyType;
-
-typedef enum collMask {
-    CMASK_MAP    = 2,
-    CMASK_OBJECT = 4,
-    CMASK_ALL    = ~0
-} CollMask;
-
-typedef struct body {
-    dBodyID body;
-    dGeomID geom;
-    BodyType type;
-    Vector3 size;
-    Model display;
-    Color color;
-} Body;
+typedef struct peerInfo {
+    ENetPeer* peer;
+    i32 playerID;
+} PeerInfo;
 
 static Body bodies[MAX_BODIES];
 static i32 bodiesCount = 0;
+
+// static Body bodies[MAX_BODIES];
 
 static dWorldID world;
 static dSpaceID space;
@@ -50,13 +40,8 @@ static dJointGroupID contactGroup;
 
 static Shader shadowShader;
 
-static u32 randState;
+static ENetHost* enetHost;
 
-static u32 Rand_Next(void);
-static i32 Rand_Int(i32 min, i32 max);
-static f64 Rand_Double(f64 min, f64 max);
-
-static void HandleInput(Camera3D* camera, f32 moveSpeed, f32 turnSpeed, f32 dt);
 static void NearCallback(void* data, dGeomID o1, dGeomID o2);
 static i32 AddBody(BodyType type, CollMask category, CollMask collide, Vector3 pos, Vector3 size, i8 isKinematic);
 static i32 AddBodyMap(Vector3 pos, Vector3 rot, Vector3 size);
@@ -89,14 +74,175 @@ static void DrawScene(void) {
             0.f, 0.f, 0.f, 1.f
         };
 
-        DrawModel(bodies[i].display, (Vector3){0.f, 0.f, 0.f}, 1.f, bodies[i].color);
+        DrawModel(bodies[i].display, (Vector3){0.f, 0.f, 0.f}, 1.f, bodies[i].col);
     }
+
+    for (i32 i = 0; i < MAX_PLAYERS; i++) {
+        if (i == localID || players[i].id == -1) {
+            continue;
+        }
+
+        // printf("DRAWING PLAYER %d AT: %f %f %f\n", i, players[i].pos.x, players[i].pos.y, players[i].pos.z);
+        DrawSphere(players[i].pos, 0.5f, BLUE);
+        DrawLine3D(players[i].pos, Vector3Add(players[i].pos, Vector3Scale(players[i].dir, 5.f)), RED);
+    }
+}
+
+static i8 StartServer(void) {
+    if (enet_initialize() != 0) {
+        TraceLog(LOG_ERROR, "enet initialization error\n");
+        return 1;
+    }
+
+    atexit(enet_deinitialize);
+
+    const ENetAddress address = { .host = ENET_HOST_ANY, .port = 12345 };
+    enetHost = enet_host_create(&address, MAX_PLAYERS, 2, 0, 0);
+    if (!enetHost) {
+        TraceLog(LOG_ERROR, "server creation error\n");
+        return 1;
+    }
+
+    printf("Server started on port %u.\n", enetHost->address.port);
+
+    struct ifaddrs* interfaces;
+    if (getifaddrs(&interfaces) == 0) {
+        printf("Server available on the following IP addresses:\n");
+        for (struct ifaddrs* ifa = interfaces; ifa != NULL; ifa = ifa->ifa_next) {
+            if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET) { // Only IPv4 addresses
+                char ip[INET_ADDRSTRLEN];
+                struct sockaddr_in *sockAddr = (struct sockaddr_in *)ifa->ifa_addr;
+                inet_ntop(AF_INET, &sockAddr->sin_addr, ip, INET_ADDRSTRLEN);
+                printf("  %s (%s)\n", ip, ifa->ifa_name);
+            }
+        }
+        freeifaddrs(interfaces);
+    } else {
+        perror("getifaddrs");
+    }
+
+    PeerInfo peerInfo[MAX_PLAYERS];
+    for (i32 i = 0; i < MAX_PLAYERS; i++) {
+        peerInfo[i].peer = NULL;
+        peerInfo[i].playerID = -1;
+    }
+
+    ENetEvent event;
+    while (!WindowShouldClose()) {
+        BeginDrawing();
+        ClearBackground(GetColor(GuiGetStyle(DEFAULT, BACKGROUND_COLOR)));
+        static const char* info = "Nothing has happened yet";
+        while (enet_host_service(enetHost, &event, 500) > 0) {
+            u8 playerUpdated = 0;
+            switch (event.type) {
+                case ENET_EVENT_TYPE_CONNECT: {
+                    info = TextFormat("A new client connected from %x:%u\n", event.peer->address.host, event.peer->address.port);
+                    u8 foundEmpty = 0;
+                    for (i32 i = 0; i < MAX_PLAYERS; i++) {
+                        if (players[i].id != -1) {
+                            continue;
+                        }
+
+                        peerInfo[i].peer = event.peer;
+                        peerInfo[i].playerID = players[i].id = i;
+                        players[i].pos = players[i].dir = (Vector3){0.f, 0.f, 0.f};
+
+                        MsgPlayerID idMsg = { .msg = MSGTYPE_C_PLAYER_ID, .playerID = i };
+                        ENetPacket* packet = enet_packet_create(&idMsg, sizeof(MsgPlayerID), ENET_PACKET_FLAG_RELIABLE);
+                        enet_peer_send(event.peer, 0, packet);
+
+                        info = TextFormat("%sAssigned ID: %d\n", info, i);
+
+                        foundEmpty = playerUpdated = 1;
+                        break;
+                    }
+                    if (!foundEmpty) {
+                        enet_peer_disconnect(event.peer, 0);
+                        info = TextFormat("%sServer full, disconnected client\n", info);
+                    }
+                } break;
+                case ENET_EVENT_TYPE_RECEIVE: {
+                    info = TextFormat("Packet received from client on channel %u\n", event.channelID);
+                    switch (*(MsgType*)event.packet->data) {
+                        case MSGTYPE_S_PLAYER_UPDATE: {
+                            MsgPlayerUpdate* player = (MsgPlayerUpdate*)event.packet->data;
+                            players[player->player.id] = player->player;
+                            playerUpdated = 1;
+                            info = TextFormat("%sUpdated player %d\n", info, player->player.id);
+                        } break;
+                        default: {
+                            info = TextFormat("%sUnknown message type\n", info);
+                        } break;
+                    }
+                    enet_packet_destroy(event.packet);
+                } break;
+                case ENET_EVENT_TYPE_DISCONNECT: {
+                    for (i32 i = 0; i < MAX_PLAYERS; i++) {
+                        if (event.peer != peerInfo[i].peer) {
+                            continue;
+                        }
+                        players[i].id = peerInfo[i].playerID = -1;
+                        peerInfo[i].peer = NULL;
+                        playerUpdated = 1;
+                        info = TextFormat("Client disconnected\n");
+                        break;
+                    }
+                } break;
+                default: {
+                    info = TextFormat("Unknown event");
+                } break;
+            }
+
+            if (playerUpdated) {
+                MsgUpdatePlayers updatedPlayers = { .msg = MSGTYPE_C_UPDATE_PLAYERS };
+                memcpy(updatedPlayers.players, players, sizeof(players));
+                ENetPacket* packet = enet_packet_create(&updatedPlayers, sizeof(MsgUpdatePlayers), ENET_PACKET_FLAG_RELIABLE);
+                enet_host_broadcast(enetHost, 0, packet);
+            }
+        }
+
+        DrawText(info, 100 + 50 * sinf(GetTime()), 100, 40, GetColor(GuiGetStyle(DEFAULT, TEXT_COLOR_NORMAL)));
+        EndDrawing();
+    }
+
+    enet_host_destroy(enetHost);
+    return 0;
+}
+
+static ENetPeer* JoinServer(const i8* ip, const i8* port) {
+    if (enet_initialize() != 0) {
+        TraceLog(LOG_ERROR, "error while initializing enet\n");
+        return NULL;
+    }
+
+    atexit(enet_deinitialize);
+
+    ENetAddress address;
+    enetHost = enet_host_create(NULL, 1, 2, 0, 0);
+    if (!enetHost) {
+        TraceLog(LOG_ERROR, "error while trying to create the client host\n");
+        return NULL;
+    }
+
+    enet_address_set_host(&address, ip);
+    address.port = atoi(port);
+
+    ENetPeer* peer = enet_host_connect(enetHost, &address, 2, 0); // 2 channels
+    if (!peer) {
+        TraceLog(LOG_ERROR, "no available peers for initiating an enet connection\n");
+        return NULL;
+    }
+
+    return peer;
 }
 
 i32 main(void) {
     SetTargetFPS(1000);
+    SetExitKey(KEY_RIGHT_SHIFT);
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     InitWindow(1280, 720, "Window");
+    GuiLoadStyleJungle();
+    GuiSetStyle(DEFAULT, TEXT_SIZE, 20);
 
     dInitODE();
     world = dWorldCreate();
@@ -145,65 +291,142 @@ i32 main(void) {
 
     const i32 mainFloor = AddBodyMap((Vector3){0.f, 0.f, 0.f}, (Vector3){0.f, 0.f, 0.f}, (Vector3){100.f, 1.f, 100.f});
     bodies[mainFloor].display.materials->maps[MATERIAL_MAP_DIFFUSE].texture = texture;
-    // AddBodyMap((Vector3){5.f, 3.f, 0.f}, (Vector3){0.0, 0.0, -0.8}, (Vector3){1.f, 10.f, 8.f});
-    AddBodyMap((Vector3){6.f, 3.f, 0.f}, (Vector3){0.f, 0.f, 0.f}, (Vector3){0.5f, 8.f, 12.f});
-    AddBodyMap((Vector3){-6.f, 3.f, 0.f}, (Vector3){0.f, 0.f, 0.f}, (Vector3){0.5f, 8.f, 12.f});
+    // AddBodyMap((Vector3){4.f, 3.f, 0.f}, (Vector3){0.f, 0.f, -0.5f}, (Vector3){0.5f, 8.f, 12.f});
+    // AddBodyMap((Vector3){-4.f, 3.f, 0.f}, (Vector3){0.f, 0.f, 0.5f}, (Vector3){0.5f, 8.f, 12.f});
     AddBodyMap((Vector3){0.f, 3.f, 6.f}, (Vector3){0.f, 0.f, 0.f}, (Vector3){12.f, 8.f, 0.5f});
     AddBodyMap((Vector3){0.f, 3.f, -6.f}, (Vector3){0.f, 0.f, 0.f}, (Vector3){12.f, 8.f, 0.5f});
 
+    for (i32 i = 0; i < MAX_PLAYERS; i++) {
+        players[i].id = -1;
+        players[i].pos = players[i].dir = (Vector3){0.f, 0.f, 0.f};
+    }
+
     while (!WindowShouldClose()) {
         const f64 deltaTime = GetFrameTime();
-        HandleInput(&cam, 2.f, 2.f, deltaTime);
 
-        const Vector3 camPos = cam.position;
-        SetShaderValue(shadowShader, shadowShader.locs[SHADER_LOC_VECTOR_VIEW], &camPos, SHADER_UNIFORM_VEC3);
+        static ENetPeer* peer = NULL;
+        static i8 isInMainMenu = 1;
+        if (isInMainMenu) {
+            BeginDrawing();
+            ClearBackground(GetColor(GuiGetStyle(DEFAULT, BACKGROUND_COLOR)));
 
-        const f32 cameraSpeed = 0.05f;
-        if (IsKeyDown(KEY_LEFT) && lightDir.x < 0.6f) {
-            lightDir.x += cameraSpeed * 60.0f * deltaTime;
-        }
-        if (IsKeyDown(KEY_RIGHT) && lightDir.x > -0.6f) {
-            lightDir.x -= cameraSpeed * 60.0f * deltaTime;
-        }
-        if (IsKeyDown(KEY_UP) && lightDir.z < 0.6f) {
-            lightDir.z += cameraSpeed * 60.0f * deltaTime;
-        }
-        if (IsKeyDown(KEY_DOWN) && lightDir.z > -0.6f) {
-            lightDir.z -= cameraSpeed * 60.0f * deltaTime;
-        }
-        if (IsKeyDown(KEY_C)) {
-            lightCam.fovy -= 30.f * deltaTime;
-            printf("\tFOV: %f\n", lightCam.fovy);
-        }
-        if (IsKeyDown(KEY_V)) {
-            lightCam.fovy += 30.f * deltaTime;
-            printf("\tFOV: %f\n", lightCam.fovy);
-        }
-        lightDir = Vector3Normalize(lightDir);
-        lightCam.position = Vector3Scale(lightDir, -200.0f);
-        SetShaderValue(shadowShader, lightDirLoc, &lightDir, SHADER_UNIFORM_VEC3);
+            const f32 sw2 = GetScreenWidth() / 2.f;
 
-        static f32 spawnTimer = 0.f;
-        spawnTimer += deltaTime;
-        if (IsKeyDown(KEY_M) && spawnTimer > 0.05f && bodiesCount < MAX_BODIES / 2) {
-            spawnTimer = 0.0f;
-            const Vector3 pos = {Rand_Double(-4.0, 4.0), Rand_Double(20.0, 50.0), Rand_Double(-4.0, 4.0)};
-            i32 added;
-            switch (Rand_Int(0, 2)) {
-                case 0: {
-                    added = AddBody(BODYTYPE_BOX, CMASK_OBJECT, CMASK_ALL, pos, (Vector3){Rand_Double(0.2, 1.0), Rand_Double(0.2, 1.0), Rand_Double(0.2, 1.0)}, 0);
+            const i8* menuTitle = "main menu text";
+            DrawText(menuTitle, sw2 - MeasureText(menuTitle, 40) / 2.f, 100, 40, BLACK);
+
+            static i8 joinSelected = 0;
+            if (!joinSelected && GuiButton((Rectangle){ sw2 - 100, 200, 200, 50 }, "Start Server")) {
+                if (StartServer() == 0) {
+                    isInMainMenu = 0;
+                }
+                continue;
+            }
+
+            if (!joinSelected && GuiButton((Rectangle){ sw2 - 100, 300, 200, 50 }, "Join Server")) {
+                joinSelected = 1;
+                continue;
+            }
+
+            static i8 ipEditMode = 0, portEditMode = 0;
+            static i8 ipAddress[20] = "127.0.0.1", port[10] = "12345";
+            if (joinSelected) {
+                GuiLabel((Rectangle){sw2 - 100, 200, 200, 30}, "Enter IP and Port");
+                if (GuiTextBox((Rectangle){ sw2 - 100, 250, 200, 30 }, ipAddress, sizeof(ipAddress), ipEditMode)) {
+                    ipEditMode = !ipEditMode;
+                }
+                if (GuiTextBox((Rectangle){ sw2 - 100, 300, 200, 30 }, port, sizeof(port), portEditMode)) {
+                    portEditMode = !portEditMode;
+                }
+
+                if (GuiButton((Rectangle){ sw2 - 100, 350, 200, 50 }, "#159#Connect")) {
+                    isInMainMenu = (peer = JoinServer(ipAddress, port)) == NULL;
+                }
+            }
+
+            EndDrawing();
+            continue;
+        }
+
+        ENetEvent event;
+        while (enet_host_service(enetHost, &event, 0) > 0) {
+            switch (event.type) {
+                case ENET_EVENT_TYPE_RECEIVE: {
+                    switch (*(MsgType*)event.packet->data) {
+                        case MSGTYPE_C_PLAYER_ID: {
+                            if (-1 != localID) {
+                                break;
+                            }
+                            const MsgPlayerID* idMsg = (MsgPlayerID*)event.packet->data;
+                            const i32 id = idMsg->playerID;
+                            players[id].id = localID = id;
+                            printf("RECEIVED ID: %d\n", id);
+                        } break;
+                        case MSGTYPE_C_UPDATE_PLAYERS: {
+                            const MsgUpdatePlayers* updateMsg = (MsgUpdatePlayers*)event.packet->data;
+                            for (i32 i = 0; i < MAX_PLAYERS; i++) {
+                                if (i != localID) {
+                                    players[i] = updateMsg->players[i];
+                                }
+                            }
+                        } break;
+                        case MSGTYPE_C_UPDATE_BODIES: {
+
+                        } break;
+                        default: break;
+                    }
+                    enet_packet_destroy(event.packet);
                 } break;
-                case 1: {
-                    added = AddBody(BODYTYPE_SPHERE, CMASK_OBJECT, CMASK_ALL, pos, (Vector3){Rand_Double(0.1, 0.4), 0.f, 0.f}, 0);
+                default: {
+                    printf("UNKNOWN EVENT\n");
                 } break;
             }
         }
 
-        if (IsKeyReleased(KEY_SPACE) && bodiesCount < MAX_BODIES) {
-            const Vector3 d = Vector3Normalize(Vector3Subtract(cam.target, cam.position));
-            const i32 ball = AddBody(BODYTYPE_SPHERE, CMASK_OBJECT, CMASK_OBJECT | CMASK_MAP, camPos, (Vector3){0.15f, 0.f, 0.f}, 0);
-            dBodyAddForce(bodies[ball].body, d.x * 10000.f, d.y * 10000.f, d.z * 10000.f);
+        if (localID == -1) {
+            BeginDrawing();
+            ClearBackground(BLACK);
+                DrawText("Waiting to receive ID from server", 100, 100, 30, RAYWHITE);
+            EndDrawing();
+            continue;
         }
+
+        Player_UpdateLocal(2.f, 2.f, deltaTime);
+        MsgPlayerUpdate msg = { .msg = MSGTYPE_S_PLAYER_UPDATE, .player = players[localID] };
+        ENetPacket* packet = enet_packet_create(&msg, sizeof(MsgPlayerUpdate), ENET_PACKET_FLAG_RELIABLE);
+        enet_peer_send(peer, 0, packet);
+
+        const Vector3 camPos = playerCam.position;
+        SetShaderValue(shadowShader, shadowShader.locs[SHADER_LOC_VECTOR_VIEW], &camPos, SHADER_UNIFORM_VEC3);
+
+        const f32 cameraSpeed = 0.05f * 60.f * deltaTime;
+        if (IsKeyDown(KEY_LEFT)  && lightDir.x <  0.6f) lightDir.x += cameraSpeed;
+        if (IsKeyDown(KEY_RIGHT) && lightDir.x > -0.6f) lightDir.x -= cameraSpeed;
+        if (IsKeyDown(KEY_UP)    && lightDir.z <  0.6f) lightDir.z += cameraSpeed;
+        if (IsKeyDown(KEY_DOWN)  && lightDir.z > -0.6f) lightDir.z -= cameraSpeed;
+        lightDir = Vector3Normalize(lightDir);
+        lightCam.position = Vector3Scale(lightDir, -200.0f);
+        SetShaderValue(shadowShader, lightDirLoc, &lightDir, SHADER_UNIFORM_VEC3);
+
+        // static f32 spawnTimer = 0.f;
+        // spawnTimer += deltaTime;
+        // if (IsKeyDown(KEY_M) && spawnTimer > 0.05f && bodiesCount < MAX_BODIES / 2) {
+        //     spawnTimer = 0.0f;
+        //     const Vector3 pos = {Rand_Double(-4.0, 4.0), Rand_Double(20.0, 50.0), Rand_Double(-4.0, 4.0)};
+        //     i32 added;
+        //     switch (Rand_Int(0, 2)) {
+        //         case 0: {
+        //             added = AddBody(BODYTYPE_BOX, CMASK_OBJECT, CMASK_ALL, pos, (Vector3){Rand_Double(0.2, 1.0), Rand_Double(0.2, 1.0), Rand_Double(0.2, 1.0)}, 0);
+        //         } break;
+        //         case 1: {
+        //             added = AddBody(BODYTYPE_SPHERE, CMASK_OBJECT, CMASK_ALL, pos, (Vector3){Rand_Double(0.1, 0.4), 0.f, 0.f}, 0);
+        //         } break;
+        //     }
+        // }
+        // if (IsKeyReleased(KEY_SPACE) && bodiesCount < MAX_BODIES) {
+        //     const i32 ball = AddBody(BODYTYPE_SPHERE, CMASK_OBJECT, CMASK_OBJECT | CMASK_MAP, camPos, (Vector3){0.15f, 0.f, 0.f}, 0);
+        //     dBodyAddForce(bodies[ball].body, player.dir.x * 10000.f, player.dir.y * 10000.f, player.dir.z * 10000.f);
+        // }
 
         dSpaceCollide(space, NULL, NearCallback);
         dWorldStep(world, deltaTime);
@@ -229,7 +452,7 @@ i32 main(void) {
         rlSetUniform(shadowMapLoc, &slot, SHADER_UNIFORM_INT, 1);
 
         ClearBackground(DARKGRAY);
-        BeginMode3D(cam);
+        BeginMode3D(playerCam);
             if (IsKeyDown(KEY_X)) {
                 for (i32 i = 0; i < bodiesCount; i++) {
                     if (bodies[i].type == BODYTYPE_NULL) {
@@ -329,7 +552,7 @@ static i32 AddBody(BodyType type, CollMask category, CollMask collide, Vector3 p
         }
 
         Body* body = &bodies[i];
-        body->color = (Color){Rand_Int(70, 190), Rand_Int(70, 190), Rand_Int(70, 190), 255};
+        body->col = (Color){Rand_Int(70, 190), Rand_Int(70, 190), Rand_Int(70, 190), 255};
         body->type = type;
         body->size = size;
 
@@ -373,7 +596,7 @@ static i32 AddBodyMap(Vector3 pos, Vector3 rot, Vector3 size) {
         }
 
         Body* body = &bodies[i];
-        body->color = (Color){Rand_Int(10, 30), Rand_Int(10, 30), Rand_Int(10, 30), 255};
+        body->col = (Color){Rand_Int(10, 30), Rand_Int(10, 30), Rand_Int(10, 30), 255};
         body->type = BODYTYPE_BOX;
         body->size = size;
         body->display = LoadModelFromMesh(GenMeshCube(size.x, size.y, size.z));
@@ -386,7 +609,7 @@ static i32 AddBodyMap(Vector3 pos, Vector3 rot, Vector3 size) {
         const dReal sy = sin(rot.y);
         const dReal cz = cos(rot.z);
         const dReal sz = sin(rot.z);
-        dReal rm[16] = {
+        const dReal rm[16] = {
             cy * cz,
             cz * sx * sy - cx * sz,
             cx * cz * sy + sx * sz,
@@ -433,6 +656,7 @@ static void ReleaseBody(i32 id) {
     }
     dGeomDestroy(bodies[id].geom);
     UnloadModel(bodies[id].display);
+    bodiesCount--;
 }
 
 static RenderTexture LoadShadowmapRenderTexture(i32 width, i32 height) {
@@ -474,73 +698,4 @@ static void UnloadShadowmapRenderTexture(RenderTexture2D target) {
         // queried and deleted before deleting framebuffer
         rlUnloadFramebuffer(target.id);
     }
-}
-
-static void HandleInput(Camera3D* camera, f32 moveSpeed, f32 turnSpeed, f32 dt) {
-    static float mult = 1.f;
-    if (IsKeyDown(KEY_LEFT_SHIFT)) {
-        mult += dt;
-        moveSpeed += mult * 10.f;
-    } else {
-        mult = 1.f;
-    }
-
-    static f32 yaw = 0.0f;
-    static f32 pitch = 0.0f;
-
-    Vector3 movement = {0.f, 0.f, 0.f};
-    if (IsKeyDown(KEY_W)) movement.z += moveSpeed * dt;
-    if (IsKeyDown(KEY_S)) movement.z -= moveSpeed * dt;
-    if (IsKeyDown(KEY_A)) movement.x += moveSpeed * dt;
-    if (IsKeyDown(KEY_D)) movement.x -= moveSpeed * dt;
-    if (IsKeyDown(KEY_Q)) movement.y -= moveSpeed * dt;
-    if (IsKeyDown(KEY_E)) movement.y += moveSpeed * dt;
-
-    Vector3 rotation;
-    if (IsKeyDown(KEY_I)) pitch += turnSpeed * dt;
-    if (IsKeyDown(KEY_K)) pitch -= turnSpeed * dt;
-    if (IsKeyDown(KEY_J)) yaw += turnSpeed * dt;
-    if (IsKeyDown(KEY_L)) yaw -= turnSpeed * dt;
-    pitch = Clamp(pitch, -MAX_PITCH, MAX_PITCH);
-    camera->fovy = IsKeyDown(KEY_F) ? 40.f : 90.f;
-
-    const Vector3 forward = Vector3Normalize((Vector3){
-        cosf(pitch) * sinf(yaw),
-        sinf(pitch),
-        cosf(pitch) * cosf(yaw)
-    });
-
-    const Vector3 right = Vector3Normalize(
-        Vector3CrossProduct(camera->up, forward));
-
-    camera->position = Vector3Add(camera->position, Vector3Scale(forward, movement.z));
-    camera->position = Vector3Add(camera->position, Vector3Scale(right, movement.x));
-    camera->position.y += movement.y;
-
-    camera->target = Vector3Add(camera->position, forward);
-}
-
-u32 Rand_Next(void) {
-    randState += 0xE120FC15;
-    u64 temp = (u64)randState * 0x4A39B70D;
-    const u32 m1 = (u32)((temp >> 32) ^ temp);
-    temp = (u64)m1 * 0x12FAD5C9;
-    return (u32)((temp >> 32) ^ temp);
-}
-
-i32 Rand_Int(i32 min, i32 max) {
-    if (min >= max) {
-        printf("Min >= Max (%d, %d)\n", min, max);
-        return 0;
-    }
-
-    return (i32)(Rand_Next() % (max - min)) + min;
-}
-
-f64 Rand_Double(f64 min, f64 max) {
-    if (min >= max) {
-        printf("Min >= Max (%f, %f)\n", min, max);
-    }
-
-    return (f64)(min + Rand_Next() / (f64)0xFFFFFFFF * ((f64)max - (f64)min));
 }

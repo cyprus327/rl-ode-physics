@@ -19,8 +19,6 @@
 #include "../inc/player.h"
 
 #define MAX_PITCH (89.f * DEG2RAD)
-#define MAX_BODIES 512
-#define MAP_MAX_BODIES 64
 
 #define SHADOWMAP_RESOLUTION 2048
 
@@ -29,64 +27,25 @@ typedef struct peerInfo {
     i32 playerID;
 } PeerInfo;
 
-static Body bodies[MAX_BODIES];
-static i32 bodiesCount = 0;
-
-// static Body bodies[MAX_BODIES];
-
 static dWorldID world;
 static dSpaceID space;
 static dJointGroupID contactGroup;
 
 static Shader shadowShader;
 
-static ENetHost* enetHost;
+static ENetHost* host;
+static ENetPeer* peer;
 
 static void NearCallback(void* data, dGeomID o1, dGeomID o2);
-static i32 AddBody(BodyType type, CollMask category, CollMask collide, Vector3 pos, Vector3 size, i8 isKinematic);
-static i32 AddBodyMap(Vector3 pos, Vector3 rot, Vector3 size);
-static void ReleaseBody(i32 id);
+static i32 AddBody(Body* bodies, BodyState* states, CollMask category, CollMask collide, BodyState state, i8 isKinematic);
+static i32 AddBodyMap(Body* bodies, BodyState* states, Vector3 pos, Vector3 rot, Vector3 size, Color col);
+static void ReleaseBody(RenderBody* bodies, i32 id);
+
+static void ClientAddBody(BodyState body);
 
 // all shadowmap stuff copied from the raylib example shadowmap project
 static RenderTexture LoadShadowmapRenderTexture(i32 width, i32 height);
 static void UnloadShadowmapRenderTexture(RenderTexture2D target);
-
-static void DrawScene(void) {
-    for (i32 i = 0; i < MAX_BODIES; i++) {
-        if (bodies[i].type == BODYTYPE_NULL) {
-            continue;
-        }
-
-        const dReal* pos;
-        const dReal* rot;
-        if (bodies[i].body) {
-            pos = dBodyGetPosition(bodies[i].body);
-            rot = dBodyGetRotation(bodies[i].body);
-        } else {
-            pos = dGeomGetPosition(bodies[i].geom);
-            rot = dGeomGetRotation(bodies[i].geom);
-        }
-
-        bodies[i].display.transform = (Matrix){
-            rot[0], rot[1], rot[2], pos[0],
-            rot[4], rot[5], rot[6], pos[1],
-            rot[8], rot[9], rot[10], pos[2],
-            0.f, 0.f, 0.f, 1.f
-        };
-
-        DrawModel(bodies[i].display, (Vector3){0.f, 0.f, 0.f}, 1.f, bodies[i].col);
-    }
-
-    for (i32 i = 0; i < MAX_PLAYERS; i++) {
-        if (i == localID || players[i].id == -1) {
-            continue;
-        }
-
-        // printf("DRAWING PLAYER %d AT: %f %f %f\n", i, players[i].pos.x, players[i].pos.y, players[i].pos.z);
-        DrawSphere(players[i].pos, 0.5f, BLUE);
-        DrawLine3D(players[i].pos, Vector3Add(players[i].pos, Vector3Scale(players[i].dir, 5.f)), RED);
-    }
-}
 
 static i8 StartServer(void) {
     if (enet_initialize() != 0) {
@@ -97,13 +56,13 @@ static i8 StartServer(void) {
     atexit(enet_deinitialize);
 
     const ENetAddress address = { .host = ENET_HOST_ANY, .port = 12345 };
-    enetHost = enet_host_create(&address, MAX_PLAYERS, 2, 0, 0);
-    if (!enetHost) {
+    host = enet_host_create(&address, MAX_PLAYERS, 2, 0, 0);
+    if (!host) {
         TraceLog(LOG_ERROR, "server creation error\n");
         return 1;
     }
 
-    printf("Server started on port %u.\n", enetHost->address.port);
+    printf("Server started on port %u.\n", host->address.port);
 
     struct ifaddrs* interfaces;
     if (getifaddrs(&interfaces) == 0) {
@@ -121,22 +80,45 @@ static i8 StartServer(void) {
         perror("getifaddrs");
     }
 
+    dInitODE();
+    world = dWorldCreate();
+    dWorldSetGravity(world, 0.0, -9.8, 0.0);
+    space = dHashSpaceCreate(0);
+    contactGroup = dJointGroupCreate(0);
+
     PeerInfo peerInfo[MAX_PLAYERS];
     for (i32 i = 0; i < MAX_PLAYERS; i++) {
         peerInfo[i].peer = NULL;
         peerInfo[i].playerID = -1;
     }
 
+    Body bodies[MAX_BODIES];
+    BodyState bodyStates[MAX_BODIES];
+    for (i32 i = 0; i < MAX_BODIES; i++) {
+        bodies[i].type = bodyStates[i].type = BODYTYPE_NULL;
+    }
+
+    // const Texture texture = LoadTexture("res/grassTexture.png");
+    // SetTextureFilter(texture, TEXTURE_FILTER_BILINEAR);
+
+    const i32 mainFloor = AddBodyMap(bodies, bodyStates, (Vector3){0.f, 0.f, 0.f}, (Vector3){0.f, 0.f, 0.f}, (Vector3){100.f, 1.f, 100.f}, DARKGRAY);
+    // bodies[mainFloor].display.materials->maps[MATERIAL_MAP_DIFFUSE].texture = texture;
+
+    // AddBodyMap((Vector3){4.f, 3.f, 0.f}, (Vector3){0.f, 0.f, -0.5f}, (Vector3){0.5f, 8.f, 12.f});
+    // AddBodyMap((Vector3){-4.f, 3.f, 0.f}, (Vector3){0.f, 0.f, 0.5f}, (Vector3){0.5f, 8.f, 12.f});
+    AddBodyMap(bodies, bodyStates, (Vector3){0.f, 3.f, 6.f}, (Vector3){0.f, 0.f, 0.f}, (Vector3){12.f, 8.f, 0.5f}, GREEN);
+    AddBodyMap(bodies, bodyStates, (Vector3){0.f, 3.f, -6.f}, (Vector3){0.f, 0.f, 0.f}, (Vector3){12.f, 8.f, 0.5f}, BLUE);
+
     ENetEvent event;
     while (!WindowShouldClose()) {
-        BeginDrawing();
-        ClearBackground(GetColor(GuiGetStyle(DEFAULT, BACKGROUND_COLOR)));
         static const char* info = "Nothing has happened yet";
-        while (enet_host_service(enetHost, &event, 500) > 0) {
+        while (enet_host_service(host, &event, 500) > 0) {
+            u32 start = enet_time_get();
+
             u8 playerUpdated = 0;
             switch (event.type) {
                 case ENET_EVENT_TYPE_CONNECT: {
-                    info = TextFormat("A new client connected from %x:%u\n", event.peer->address.host, event.peer->address.port);
+                    info = TextFormat("A new client connected from %x:%u\n%s", event.peer->address.host, event.peer->address.port, info);
                     u8 foundEmpty = 0;
                     for (i32 i = 0; i < MAX_PLAYERS; i++) {
                         if (players[i].id != -1) {
@@ -151,14 +133,14 @@ static i8 StartServer(void) {
                         ENetPacket* packet = enet_packet_create(&idMsg, sizeof(MsgPlayerID), ENET_PACKET_FLAG_RELIABLE);
                         enet_peer_send(event.peer, 0, packet);
 
-                        info = TextFormat("%sAssigned ID: %d\n", info, i);
+                        info = TextFormat("Assigned ID: %d\n%s", i, info);
 
                         foundEmpty = playerUpdated = 1;
                         break;
                     }
                     if (!foundEmpty) {
                         enet_peer_disconnect(event.peer, 0);
-                        info = TextFormat("%sServer full, disconnected client\n", info);
+                        info = TextFormat("Server full, disconnected client\n%s", info);
                     }
                 } break;
                 case ENET_EVENT_TYPE_RECEIVE: {
@@ -168,10 +150,15 @@ static i8 StartServer(void) {
                             MsgPlayerUpdate* player = (MsgPlayerUpdate*)event.packet->data;
                             players[player->player.id] = player->player;
                             playerUpdated = 1;
-                            info = TextFormat("%sUpdated player %d\n", info, player->player.id);
+                            info = TextFormat("Updated player %d\n%s", player->player.id, info);
+                        } break;
+                        case MSGTYPE_S_NEW_BODY: {
+                            MsgNewBody* body = (MsgNewBody*)event.packet->data;
+                            const BodyState state = body->body;
+                            const i32 id = AddBody(bodies, bodyStates, CMASK_OBJ, CMASK_OBJ | CMASK_MAP, state, 0);
                         } break;
                         default: {
-                            info = TextFormat("%sUnknown message type\n", info);
+                            info = TextFormat("Unknown message type\n%s", info);
                         } break;
                     }
                     enet_packet_destroy(event.packet);
@@ -197,43 +184,134 @@ static i8 StartServer(void) {
                 MsgUpdatePlayers updatedPlayers = { .msg = MSGTYPE_C_UPDATE_PLAYERS };
                 memcpy(updatedPlayers.players, players, sizeof(players));
                 ENetPacket* packet = enet_packet_create(&updatedPlayers, sizeof(MsgUpdatePlayers), ENET_PACKET_FLAG_RELIABLE);
-                enet_host_broadcast(enetHost, 0, packet);
+                enet_host_broadcast(host, 0, packet);
             }
+
+            static u32 counter = 0;
+            u32 delta = enet_time_get() - start;
+            if (delta > 2) {
+                printf("C: %u, D: %u\n", counter, delta);
+            }
+            counter += 0 == delta ? 1 : delta;
+            if (counter > 10) {
+                dSpaceCollide(space, NULL, NearCallback);
+                dWorldStep(world, counter / 1000.0);
+                dJointGroupEmpty(contactGroup);
+                counter = 0;
+
+                for (i32 i = 0; i < MAX_BODIES; i++) {
+                    if (BODYTYPE_NULL == bodies[i].type) {
+                        continue;
+                    }
+
+                    const dReal* pos;
+                    const dReal* rot;
+                    if (bodies[i].body) {
+                        pos = dBodyGetPosition(bodies[i].body);
+                        rot = dBodyGetRotation(bodies[i].body);
+                    } else {
+                        pos = dGeomGetPosition(bodies[i].geom);
+                        rot = dGeomGetRotation(bodies[i].geom);
+                    }
+
+                    bodyStates[i].pos = (Vector3){pos[0], pos[1], pos[2]};
+                    bodyStates[i].rot = (Vector3){0.f, 0.f, 0.f}; // TODO probably just send rotation matrix
+                }
+
+                MsgUpdateBodies updatedBodies = { .msg = MSGTYPE_C_UPDATE_BODIES };
+                memcpy(updatedBodies.bodies, bodyStates, sizeof(bodyStates));
+                ENetPacket* packet = enet_packet_create(&updatedBodies, sizeof(MsgUpdateBodies), ENET_PACKET_FLAG_RELIABLE);
+                enet_host_broadcast(host, 0, packet);
+            }
+
+            BeginDrawing();
+            ClearBackground(GetColor(GuiGetStyle(DEFAULT, BACKGROUND_COLOR)));
+                DrawText(info, 100 + 50 * sinf(GetTime()), 100, 40, GetColor(GuiGetStyle(DEFAULT, TEXT_COLOR_NORMAL)));
+            EndDrawing();
         }
 
-        DrawText(info, 100 + 50 * sinf(GetTime()), 100, 40, GetColor(GuiGetStyle(DEFAULT, TEXT_COLOR_NORMAL)));
+        BeginDrawing();
+        ClearBackground(GetColor(GuiGetStyle(DEFAULT, BACKGROUND_COLOR)));
+            DrawText(info, 100 + 50 * sinf(GetTime()), 100, 40, GetColor(GuiGetStyle(DEFAULT, TEXT_COLOR_NORMAL)));
         EndDrawing();
     }
 
-    enet_host_destroy(enetHost);
+    enet_host_destroy(host);
+    for (i32 i = 0; i < MAX_BODIES; i++) {
+        if (bodies[i].body) {
+            dBodyDestroy(bodies[i].body);
+        }
+        dGeomDestroy(bodies[i].geom);
+    }
+    dJointGroupDestroy(contactGroup);
+    dWorldDestroy(world);
+    dCloseODE();
+    CloseWindow();
     return 0;
 }
 
-static ENetPeer* JoinServer(const i8* ip, const i8* port) {
+static u8 JoinServer(const i8* ip, const i8* port) {
     if (enet_initialize() != 0) {
-        TraceLog(LOG_ERROR, "error while initializing enet\n");
-        return NULL;
+        TraceLog(LOG_ERROR, "Error while initializing enet\n");
+        return 1;
     }
 
     atexit(enet_deinitialize);
 
     ENetAddress address;
-    enetHost = enet_host_create(NULL, 1, 2, 0, 0);
-    if (!enetHost) {
-        TraceLog(LOG_ERROR, "error while trying to create the client host\n");
-        return NULL;
+    host = enet_host_create(NULL, 1, 2, 0, 0);
+    if (!host) {
+        TraceLog(LOG_ERROR, "Error while trying to create the client host\n");
+        return 1;
     }
 
     enet_address_set_host(&address, ip);
     address.port = atoi(port);
 
-    ENetPeer* peer = enet_host_connect(enetHost, &address, 2, 0); // 2 channels
+    peer = enet_host_connect(host, &address, 2, 0); // 2 channels
     if (!peer) {
-        TraceLog(LOG_ERROR, "no available peers for initiating an enet connection\n");
-        return NULL;
+        TraceLog(LOG_ERROR, "No available peers for initiating an enet connection\n");
+        return 1;
     }
 
-    return peer;
+    return 0;
+}
+
+static void DrawScene(RenderBody* bodies) {
+    for (i32 i = 0; i < MAX_BODIES; i++) {
+        if (bodies[i].state.type == BODYTYPE_NULL) {
+            continue;
+        }
+
+        const Vector3 pos = bodies[i].state.pos;
+        const Vector3 rot = bodies[i].state.rot;
+
+        // TODO fix this
+        // bodies[i].display.transform = (Matrix){
+        //     0.f, 0.f, 0.f, pos.x,
+        //     0.f, 0.f, 0.f, pos.y,
+        //     0.f, 0.f, 0.f, pos.z,
+        //     0.f, 0.f, 0.f, 1.f
+        // };
+        // bodies[i].display.transform = (Matrix){
+        //     rot[0], rot[1], rot[2], pos[0],
+        //     rot[4], rot[5], rot[6], pos[1],
+        //     rot[8], rot[9], rot[10], pos[2],
+        //     0.f, 0.f, 0.f, 1.f
+        // };
+
+        DrawModel(bodies[i].display, pos, 1.f, bodies[i].state.col);
+    }
+
+    for (i32 i = 0; i < MAX_PLAYERS; i++) {
+        if (i == localID || players[i].id == -1) {
+            continue;
+        }
+
+        // printf("DRAWING PLAYER %d AT: %f %f %f\n", i, players[i].pos.x, players[i].pos.y, players[i].pos.z);
+        DrawSphere(players[i].pos, 0.5f, BLUE);
+        DrawLine3D(players[i].pos, Vector3Add(players[i].pos, Vector3Scale(players[i].dir, 5.f)), RED);
+    }
 }
 
 i32 main(void) {
@@ -244,16 +322,16 @@ i32 main(void) {
     GuiLoadStyleJungle();
     GuiSetStyle(DEFAULT, TEXT_SIZE, 20);
 
-    dInitODE();
-    world = dWorldCreate();
-    dWorldSetGravity(world, 0.0, -9.8, 0.0);
-    space = dHashSpaceCreate(0);
-    contactGroup = dJointGroupCreate(0);
-
     randState = (u32)time(NULL);
 
+    for (i32 i = 0; i < MAX_PLAYERS; i++) {
+        players[i].id = -1;
+        players[i].pos = players[i].dir = (Vector3){0.f, 0.f, 0.f};
+    }
+
+    RenderBody bodies[MAX_BODIES];
     for (i32 i = 0; i < MAX_BODIES; i++) {
-        bodies[i].type = BODYTYPE_NULL;
+        bodies[i].state.type = BODYTYPE_NULL;
     }
 
     shadowShader = LoadShader("res/shadowMap.vert", "res/shadowMap.frag");
@@ -286,44 +364,28 @@ i32 main(void) {
     lightCam.up = (Vector3){ 0.0f, 1.0f, 0.0f };
     lightCam.fovy = 200.0f;
 
-    const Texture texture = LoadTexture("res/grassTexture.png");
-    SetTextureFilter(texture, TEXTURE_FILTER_BILINEAR);
-
-    const i32 mainFloor = AddBodyMap((Vector3){0.f, 0.f, 0.f}, (Vector3){0.f, 0.f, 0.f}, (Vector3){100.f, 1.f, 100.f});
-    bodies[mainFloor].display.materials->maps[MATERIAL_MAP_DIFFUSE].texture = texture;
-    // AddBodyMap((Vector3){4.f, 3.f, 0.f}, (Vector3){0.f, 0.f, -0.5f}, (Vector3){0.5f, 8.f, 12.f});
-    // AddBodyMap((Vector3){-4.f, 3.f, 0.f}, (Vector3){0.f, 0.f, 0.5f}, (Vector3){0.5f, 8.f, 12.f});
-    AddBodyMap((Vector3){0.f, 3.f, 6.f}, (Vector3){0.f, 0.f, 0.f}, (Vector3){12.f, 8.f, 0.5f});
-    AddBodyMap((Vector3){0.f, 3.f, -6.f}, (Vector3){0.f, 0.f, 0.f}, (Vector3){12.f, 8.f, 0.5f});
-
-    for (i32 i = 0; i < MAX_PLAYERS; i++) {
-        players[i].id = -1;
-        players[i].pos = players[i].dir = (Vector3){0.f, 0.f, 0.f};
-    }
-
     while (!WindowShouldClose()) {
         const f64 deltaTime = GetFrameTime();
 
-        static ENetPeer* peer = NULL;
         static i8 isInMainMenu = 1;
         if (isInMainMenu) {
             BeginDrawing();
             ClearBackground(GetColor(GuiGetStyle(DEFAULT, BACKGROUND_COLOR)));
 
             const f32 sw2 = GetScreenWidth() / 2.f;
+            const i32 bw = 200, bh = 50;
 
             const i8* menuTitle = "main menu text";
             DrawText(menuTitle, sw2 - MeasureText(menuTitle, 40) / 2.f, 100, 40, BLACK);
 
             static i8 joinSelected = 0;
-            if (!joinSelected && GuiButton((Rectangle){ sw2 - 100, 200, 200, 50 }, "Start Server")) {
+            if (!joinSelected && GuiButton((Rectangle){ sw2 - bw / 2.f, 200, bw, bh }, "Start Server")) {
                 if (StartServer() == 0) {
-                    isInMainMenu = 0;
+                    return 0;
                 }
-                continue;
             }
 
-            if (!joinSelected && GuiButton((Rectangle){ sw2 - 100, 300, 200, 50 }, "Join Server")) {
+            if (!joinSelected && GuiButton((Rectangle){ sw2 - bw / 2.f, 300, bw, bh }, "Join Server")) {
                 joinSelected = 1;
                 continue;
             }
@@ -331,16 +393,16 @@ i32 main(void) {
             static i8 ipEditMode = 0, portEditMode = 0;
             static i8 ipAddress[20] = "127.0.0.1", port[10] = "12345";
             if (joinSelected) {
-                GuiLabel((Rectangle){sw2 - 100, 200, 200, 30}, "Enter IP and Port");
-                if (GuiTextBox((Rectangle){ sw2 - 100, 250, 200, 30 }, ipAddress, sizeof(ipAddress), ipEditMode)) {
+                GuiLabel((Rectangle){sw2 - bw / 2.f, 200, bw, bh}, "Enter IP and Port");
+                if (GuiTextBox((Rectangle){ sw2 - bw / 2.f, 250, bw, bh }, ipAddress, sizeof(ipAddress), ipEditMode)) {
                     ipEditMode = !ipEditMode;
                 }
-                if (GuiTextBox((Rectangle){ sw2 - 100, 300, 200, 30 }, port, sizeof(port), portEditMode)) {
+                if (GuiTextBox((Rectangle){ sw2 - bw / 2.f, 300, bw, bh }, port, sizeof(port), portEditMode)) {
                     portEditMode = !portEditMode;
                 }
 
-                if (GuiButton((Rectangle){ sw2 - 100, 350, 200, 50 }, "#159#Connect")) {
-                    isInMainMenu = (peer = JoinServer(ipAddress, port)) == NULL;
+                if (GuiButton((Rectangle){ sw2 - bw / 2.f, 350, bw, bh }, "#159#Connect")) {
+                    isInMainMenu = 1 == JoinServer(ipAddress, port);
                 }
             }
 
@@ -349,7 +411,7 @@ i32 main(void) {
         }
 
         ENetEvent event;
-        while (enet_host_service(enetHost, &event, 0) > 0) {
+        while (enet_host_service(host, &event, 0) > 0) {
             switch (event.type) {
                 case ENET_EVENT_TYPE_RECEIVE: {
                     switch (*(MsgType*)event.packet->data) {
@@ -371,7 +433,26 @@ i32 main(void) {
                             }
                         } break;
                         case MSGTYPE_C_UPDATE_BODIES: {
+                            const MsgUpdateBodies* updateMsg = (MsgUpdateBodies*)event.packet->data;
+                            for (i32 i = 0; i < MAX_BODIES; i++) {
+                                const Vector3 p = updateMsg->bodies[i].pos;
+                                if (BODYTYPE_NULL == bodies[i].state.type && BODYTYPE_NULL != updateMsg->bodies[i].type) {
+                                    const Vector3 s = updateMsg->bodies[i].size;
+                                    switch (updateMsg->bodies[i].type) {
+                                        case BODYTYPE_BOX: {
+                                            bodies[i].display = LoadModelFromMesh(GenMeshCube(s.x, s.y, s.z));
+                                        } break;
+                                        case BODYTYPE_SPHERE: {
+                                            bodies[i].display = LoadModelFromMesh(GenMeshSphere(s.x, 16, 16));
+                                        } break;
+                                        case BODYTYPE_NULL: break; // can't happen
+                                    }
+                                    bodies[i].display.materials[0].shader = shadowShader;
+                                    printf("CREATED NEW MESH, SIZE: %f %f %f, POS: %f %f %f\n", s.x, s.y, s.z, p.x, p.y, p.z);
+                                }
 
+                                bodies[i].state = updateMsg->bodies[i];
+                            }
                         } break;
                         default: break;
                     }
@@ -408,29 +489,40 @@ i32 main(void) {
         lightCam.position = Vector3Scale(lightDir, -200.0f);
         SetShaderValue(shadowShader, lightDirLoc, &lightDir, SHADER_UNIFORM_VEC3);
 
-        // static f32 spawnTimer = 0.f;
-        // spawnTimer += deltaTime;
-        // if (IsKeyDown(KEY_M) && spawnTimer > 0.05f && bodiesCount < MAX_BODIES / 2) {
-        //     spawnTimer = 0.0f;
-        //     const Vector3 pos = {Rand_Double(-4.0, 4.0), Rand_Double(20.0, 50.0), Rand_Double(-4.0, 4.0)};
-        //     i32 added;
-        //     switch (Rand_Int(0, 2)) {
-        //         case 0: {
-        //             added = AddBody(BODYTYPE_BOX, CMASK_OBJECT, CMASK_ALL, pos, (Vector3){Rand_Double(0.2, 1.0), Rand_Double(0.2, 1.0), Rand_Double(0.2, 1.0)}, 0);
-        //         } break;
-        //         case 1: {
-        //             added = AddBody(BODYTYPE_SPHERE, CMASK_OBJECT, CMASK_ALL, pos, (Vector3){Rand_Double(0.1, 0.4), 0.f, 0.f}, 0);
-        //         } break;
-        //     }
-        // }
-        // if (IsKeyReleased(KEY_SPACE) && bodiesCount < MAX_BODIES) {
-        //     const i32 ball = AddBody(BODYTYPE_SPHERE, CMASK_OBJECT, CMASK_OBJECT | CMASK_MAP, camPos, (Vector3){0.15f, 0.f, 0.f}, 0);
-        //     dBodyAddForce(bodies[ball].body, player.dir.x * 10000.f, player.dir.y * 10000.f, player.dir.z * 10000.f);
-        // }
-
-        dSpaceCollide(space, NULL, NearCallback);
-        dWorldStep(world, deltaTime);
-        dJointGroupEmpty(contactGroup);
+        static f32 spawnTimer = 0.f;
+        spawnTimer += deltaTime;
+        if (IsKeyDown(KEY_M) && spawnTimer > 0.1f) {
+            spawnTimer = 0.0f;
+            const Vector3 pos = {Rand_Double(-4.0, 4.0), Rand_Double(20.0, 50.0), Rand_Double(-4.0, 4.0)};
+            if (Rand_Int(0, 2) == 0) {
+                ClientAddBody((BodyState){
+                    .type = BODYTYPE_BOX,
+                    .pos = pos,
+                    .rot = (Vector3){0.f, 0.f, 0.f},
+                    .size = (Vector3){Rand_Double(0.2, 1.0), Rand_Double(0.2, 1.0), Rand_Double(0.2, 1.0)},
+                    .col = Rand_Color(30, 190)
+                });
+            } else {
+                ClientAddBody((BodyState){
+                    .type = BODYTYPE_SPHERE,
+                    .pos = pos,
+                    .rot = (Vector3){0.f, 0.f, 0.f},
+                    .size = (Vector3){Rand_Double(0.1, 0.4), 0.f, 0.f},
+                    .col = Rand_Color(30, 190)
+                });
+            }
+        }
+        if (IsKeyReleased(KEY_SPACE)) {
+            ClientAddBody((BodyState){
+                .type = BODYTYPE_SPHERE,
+                .pos = camPos,
+                .rot = (Vector3){0.f, 0.f, 0.f},
+                .size = (Vector3){0.15f, 0.f, 0.f},
+                .col = Rand_Color(30, 190)
+            });
+            // TODO allow clients to create bodies with initial forces
+            // dBodyAddForce(bodies[ball].body, player.dir.x * 10000.f, player.dir.y * 10000.f, player.dir.z * 10000.f);
+        }
 
         Matrix lightView, lightProj;
         BeginTextureMode(shadowMap);
@@ -438,7 +530,7 @@ i32 main(void) {
         BeginMode3D(lightCam);
             lightView = rlGetMatrixModelview();
             lightProj = rlGetMatrixProjection();
-            DrawScene();
+            DrawScene(bodies);
         EndMode3D();
         EndTextureMode();
 
@@ -454,48 +546,47 @@ i32 main(void) {
         ClearBackground(DARKGRAY);
         BeginMode3D(playerCam);
             if (IsKeyDown(KEY_X)) {
-                for (i32 i = 0; i < bodiesCount; i++) {
-                    if (bodies[i].type == BODYTYPE_NULL) {
+                for (i32 i = 0; i < MAX_BODIES; i++) {
+                    if (BODYTYPE_NULL == bodies[i].state.type) {
                         continue;
                     }
 
-                    const dReal* pos;
-                    const dReal* rot;
-                    if (bodies[i].body) {
-                        pos = dBodyGetPosition(bodies[i].body);
-                        rot = dBodyGetRotation(bodies[i].body);
-                    } else {
-                        pos = dGeomGetPosition(bodies[i].geom);
-                        rot = dGeomGetRotation(bodies[i].geom);
-                    }
+                    const Vector3 pos = bodies[i].state.pos;
+                    // const Vector3 rot = bodies[i].state.rot;
 
+                    // TODO fix this
                     const f32 transform[16] = {
-                        rot[0], rot[4], rot[8],  0.0f,
-                        rot[1], rot[5], rot[9],  0.0f,
-                        rot[2], rot[6], rot[10], 0.0f,
-                        pos[0], pos[1], pos[2],  1.0f
+                        0.f, 0.f, 0.f, 0.f,
+                        0.f, 0.f, 0.f, 0.f,
+                        0.f, 0.f, 0.f, 0.f,
+                        pos.x, pos.y, pos.z, 1.f
                     };
+                    // const f32 transform[16] = {
+                    //     rot[0], rot[4], rot[8],  0.0f,
+                    //     rot[1], rot[5], rot[9],  0.0f,
+                    //     rot[2], rot[6], rot[10], 0.0f,
+                    //     pos[0], pos[1], pos[2],  1.0f
+                    // };
 
                     rlPushMatrix();
                     rlMultMatrixf(transform);
 
-                    switch (bodies[i].type) {
+                    switch (bodies[i].state.type) {
                         case BODYTYPE_NULL: break; // obviously can't happen just to make lsp happy
                         case BODYTYPE_SPHERE: {
-                            const f32 radius = dGeomSphereGetRadius(bodies[i].geom);
+                            const f32 radius = bodies[i].state.size.x;
                             DrawSphereWires((Vector3){0.f, 0.f, 0.f}, radius, 12, 12, MAGENTA);
                         } break;
                         case BODYTYPE_BOX: {
-                            dVector3 sides;
-                            dGeomBoxGetLengths(bodies[i].geom, sides);
-                            DrawCubeWires((Vector3){0.f, 0.f, 0.f}, sides[0], sides[1], sides[2], MAGENTA);
+                            const Vector3 size = bodies[i].state.size;
+                            DrawCubeWires((Vector3){0.f, 0.f, 0.f}, size.x, size.y, size.z, MAGENTA);
                         } break;
                     }
 
                     rlPopMatrix();
                 }
             } else {
-                DrawScene();
+                DrawScene(bodies);
             }
             DrawSphere(lightCam.position, 1.f, lightColor);
             DrawSphereWires(lightCam.position, 1.f, 10, 10, BLACK);
@@ -507,14 +598,6 @@ i32 main(void) {
         EndDrawing();
     }
 
-    for (i32 i = 0; i < MAX_BODIES; i++) {
-        if (bodies[i].type != BODYTYPE_NULL) {
-            ReleaseBody(i);
-        }
-    }
-    dJointGroupDestroy(contactGroup);
-    dWorldDestroy(world);
-    dCloseODE();
     UnloadShadowmapRenderTexture(shadowMap);
     CloseWindow();
     return 0;
@@ -541,122 +624,117 @@ static void NearCallback(void* data, dGeomID o1, dGeomID o2) {
     }
 }
 
-static i32 AddBody(BodyType type, CollMask category, CollMask collide, Vector3 pos, Vector3 size, i8 isKinematic) {
-    if (bodiesCount >= MAX_BODIES) {
-        return -1;
-    }
+static inline void GetRotationMatrix(dReal res[16], Vector3 rot) {
+    const dReal cx = cos(rot.x);
+    const dReal sx = sin(rot.x);
+    const dReal cy = cos(rot.y);
+    const dReal sy = sin(rot.y);
+    const dReal cz = cos(rot.z);
+    const dReal sz = sin(rot.z);
 
+    res[0] = cy * cz;
+    res[1] = cz * sx * sy - cx * sz;
+    res[2] = cx * cz * sy + sx * sz;
+    res[3] = 0;
+
+    res[4] = cy * sz;
+    res[5] = cx * cz + sx * sy * sz;
+    res[6] = -cz * sx + cx * sy * sx;
+    res[7] = 0;
+
+    res[8] = -sy;
+    res[9] = cy * sx;
+    res[10] = cx * cy;
+    res[11] = 0;
+
+    res[12] = 0;
+    res[13] = 0;
+    res[14] = 0;
+    res[15] = 1;
+}
+
+static i32 AddBody(Body* bodies, BodyState* states, CollMask category, CollMask collide, BodyState state, i8 isKinematic) {
     for (i32 i = 0; i < MAX_BODIES; i++) {
         if (bodies[i].type != BODYTYPE_NULL) {
             continue;
         }
 
-        Body* body = &bodies[i];
-        body->col = (Color){Rand_Int(70, 190), Rand_Int(70, 190), Rand_Int(70, 190), 255};
-        body->type = type;
-        body->size = size;
 
+        Body* body = &bodies[i];
+        body->type = state.type;
         body->body = dBodyCreate(world);
-        dBodySetPosition(body->body, pos.x, pos.y, pos.z);
+        dBodySetPosition(body->body, state.pos.x, state.pos.y, state.pos.z);
+
+        dReal rm[16];
+        GetRotationMatrix(rm, state.rot);
+        dBodySetRotation(body->body, rm);
+
         if (isKinematic) {
             dBodySetKinematic(body->body);
         }
 
-        switch (type) {
+        switch (state.type) {
             case BODYTYPE_SPHERE: {
-                body->geom = dCreateSphere(space, size.x);
-                body->display = LoadModelFromMesh(GenMeshSphere(size.x, 18, 18));
+                body->geom = dCreateSphere(space, state.size.x);
+                // body->display = LoadModelFromMesh(GenMeshSphere(state.size.x, 18, 18));
             } break;
             case BODYTYPE_BOX: {
-                body->geom = dCreateBox(space, size.x, size.y, size.z);
-                body->display = LoadModelFromMesh(GenMeshCube(size.x, size.y, size.z));
+                body->geom = dCreateBox(space, state.size.x, state.size.y, state.size.z);
+                // body->display = LoadModelFromMesh(GenMeshCube(state.size.x, state.size.y, state.size.z));
             } break;
             default: return -1;
         }
-        body->display.materials[0].shader = shadowShader;
+        // body->display.materials[0].shader = shadowShader;
         dGeomSetCategoryBits(body->geom, category);
         dGeomSetCollideBits(body->geom, collide);
         dGeomSetBody(body->geom, body->body);
 
-        bodiesCount++;
+        states[i] = state;
         return i;
     }
 
     return -1;
 }
 
-static i32 AddBodyMap(Vector3 pos, Vector3 rot, Vector3 size) {
-    if (bodiesCount >= MAP_MAX_BODIES) {
-        return -1;
-    }
-
+static i32 AddBodyMap(Body* bodies, BodyState* states, Vector3 pos, Vector3 rot, Vector3 size, Color col) {
     for (i32 i = 0; i < MAX_BODIES; i++) {
         if (bodies[i].type != BODYTYPE_NULL) {
             continue;
         }
 
         Body* body = &bodies[i];
-        body->col = (Color){Rand_Int(10, 30), Rand_Int(10, 30), Rand_Int(10, 30), 255};
         body->type = BODYTYPE_BOX;
-        body->size = size;
-        body->display = LoadModelFromMesh(GenMeshCube(size.x, size.y, size.z));
-        body->display.materials[0].shader = shadowShader;
         body->geom = dCreateBox(space, size.x, size.y, size.z);
 
-        const dReal cx = cos(rot.x);
-        const dReal sx = sin(rot.x);
-        const dReal cy = cos(rot.y);
-        const dReal sy = sin(rot.y);
-        const dReal cz = cos(rot.z);
-        const dReal sz = sin(rot.z);
-        const dReal rm[16] = {
-            cy * cz,
-            cz * sx * sy - cx * sz,
-            cx * cz * sy + sx * sz,
-            0,
-
-            cy * sz,
-            cx * cz + sx * sy * sz,
-            -cz * sx + cx * sy * sx,
-            0,
-
-            -sy,
-            cy * sx,
-            cx * cy,
-            0,
-
-            0, 0, 0, 1
-        };
+        dReal rm[16];
+        GetRotationMatrix(rm, rot);
         dGeomSetRotation(body->geom, rm);
         dGeomSetPosition(body->geom, pos.x, pos.y, pos.z);
 
         dGeomSetCategoryBits(body->geom, CMASK_MAP);
         dGeomSetCategoryBits(body->geom, CMASK_ALL & ~CMASK_MAP);
         body->body = NULL;
-        // body->body = dBodyCreate(world);
-        // dBodySetPosition(body->body, pos.x, pos.y, pos.z);
-        // dGeomSetBody(body->geom, body->body);
-        // dBodySetKinematic(body->body);
 
-        bodiesCount++;
+        states[i] = (BodyState){ .pos = pos, .rot = rot, .size = size, .col = col, .type = BODYTYPE_BOX };
         return i;
     }
 
     return -1;
 }
 
-static void ReleaseBody(i32 id) {
-    if (bodies[id].type == BODYTYPE_NULL) {
+static void ReleaseBody(RenderBody* bodies, i32 id) {
+    if (bodies[id].state.type == BODYTYPE_NULL) {
         return;
     }
 
-    bodies[id].type = BODYTYPE_NULL;
-    if (bodies[id].body) {
-        dBodyDestroy(bodies[id].body);
-    }
-    dGeomDestroy(bodies[id].geom);
+    bodies[id].state.type = BODYTYPE_NULL;
     UnloadModel(bodies[id].display);
-    bodiesCount--;
+}
+
+static void ClientAddBody(BodyState body) {
+    MsgNewBody msg = { .msg = MSGTYPE_S_NEW_BODY, .body = body };
+    ENetPacket* packet = enet_packet_create(&msg, sizeof(MsgNewBody), ENET_PACKET_FLAG_RELIABLE);
+    enet_peer_send(peer, 0, packet);
 }
 
 static RenderTexture LoadShadowmapRenderTexture(i32 width, i32 height) {

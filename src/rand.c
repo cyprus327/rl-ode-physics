@@ -28,3 +28,7 @@ f64 Rand_Double(f64 min, f64 max) {
 
     return (f64)(min + Rand_Next() / (f64)0xFFFFFFFF * ((f64)max - (f64)min));
 }
+
+Color Rand_Color(u8 min, u8 max) {
+    return (Color){ .r = (u8)Rand_Int(min, max), .g = (u8)Rand_Int(min, max), .b = (u8)Rand_Int(min, max), 255 };
+}

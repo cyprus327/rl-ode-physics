@@ -1,7 +1,7 @@
 #pragma once
 
 #include "raylib.h"
-#include "ode/ode.h"
+#include "ode/common.h"
 
 #define MAX_BODIES 512
 
@@ -25,7 +25,8 @@ typedef struct body {
 
 typedef struct bodyState {
     BodyType type;
-    Vector3 pos, rot, size;
+    dReal transform[16];
+    Vector3 size;
     Color col;
 } BodyState;
 

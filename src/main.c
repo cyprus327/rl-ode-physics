@@ -36,6 +36,10 @@ static Shader shadowShader;
 static ENetHost* host;
 static ENetPeer* peer;
 
+static inline void GetTransformMat(dReal res[16], const dReal* pos, const dReal* rot);
+static inline void GetTransformMatV(dReal res[16], Vector3 pos, Vector3 rot);
+static inline Matrix GetRLFromODEMat(const dReal mat[16]);
+
 static void NearCallback(void* data, dGeomID o1, dGeomID o2);
 static i32 AddBody(Body* bodies, BodyState* states, CollMask category, CollMask collide, BodyState state, i8 isKinematic);
 static i32 AddBodyMap(Body* bodies, BodyState* states, Vector3 pos, Vector3 rot, Vector3 size, Color col);
@@ -104,16 +108,28 @@ static i8 StartServer(void) {
     const i32 mainFloor = AddBodyMap(bodies, bodyStates, (Vector3){0.f, 0.f, 0.f}, (Vector3){0.f, 0.f, 0.f}, (Vector3){100.f, 1.f, 100.f}, DARKGRAY);
     // bodies[mainFloor].display.materials->maps[MATERIAL_MAP_DIFFUSE].texture = texture;
 
-    // AddBodyMap((Vector3){4.f, 3.f, 0.f}, (Vector3){0.f, 0.f, -0.5f}, (Vector3){0.5f, 8.f, 12.f});
-    // AddBodyMap((Vector3){-4.f, 3.f, 0.f}, (Vector3){0.f, 0.f, 0.5f}, (Vector3){0.5f, 8.f, 12.f});
-    AddBodyMap(bodies, bodyStates, (Vector3){0.f, 3.f, 6.f}, (Vector3){0.f, 0.f, 0.f}, (Vector3){12.f, 8.f, 0.5f}, GREEN);
+    // AddBodyMap(bodies, bodyStates, (Vector3){4.f, 3.f, 0.f}, (Vector3){0.f, 0.f, -0.5f}, (Vector3){0.5f, 8.f, 12.f}, RED);
+    // AddBodyMap(bodies, bodyStates, (Vector3){-4.f, 3.f, 0.f}, (Vector3){0.f, 0.f, 0.5f}, (Vector3){0.5f, 8.f, 12.f}, YELLOW);
+    AddBodyMap(bodies, bodyStates, (Vector3){0.f, 3.f, 6.f}, (Vector3){0.f, 0.f, M_PI / 2}, (Vector3){12.f, 8.f, 0.5f}, GREEN);
     AddBodyMap(bodies, bodyStates, (Vector3){0.f, 3.f, -6.f}, (Vector3){0.f, 0.f, 0.f}, (Vector3){12.f, 8.f, 0.5f}, BLUE);
 
     ENetEvent event;
+    const char* info = "Nothing has happened yet";
     while (!WindowShouldClose()) {
-        static const char* info = "Nothing has happened yet";
+        BeginDrawing();
+        ClearBackground(GetColor(GuiGetStyle(DEFAULT, BACKGROUND_COLOR)));
+            DrawText(info, 100 + 50 * sinf(GetTime()), 100, 40, GetColor(GuiGetStyle(DEFAULT, TEXT_COLOR_NORMAL)));
+        EndDrawing();
+
         while (enet_host_service(host, &event, 500) > 0) {
-            u32 start = enet_time_get();
+            if (WindowShouldClose()) {
+                goto BREAK;
+            }
+            BeginDrawing();
+            ClearBackground(GetColor(GuiGetStyle(DEFAULT, BACKGROUND_COLOR)));
+                DrawFPS(10, 10);
+                DrawText(info, 100 + 50 * sinf(GetTime()), 100, 40, GetColor(GuiGetStyle(DEFAULT, TEXT_COLOR_NORMAL)));
+            EndDrawing();
 
             u8 playerUpdated = 0;
             switch (event.type) {
@@ -187,15 +203,11 @@ static i8 StartServer(void) {
                 enet_host_broadcast(host, 0, packet);
             }
 
-            static u32 counter = 0;
-            u32 delta = enet_time_get() - start;
-            if (delta > 2) {
-                printf("C: %u, D: %u\n", counter, delta);
-            }
-            counter += 0 == delta ? 1 : delta;
-            if (counter > 10) {
+            static f32 counter = 0;
+            counter += GetFrameTime();
+            if (counter > 0.016f) {
                 dSpaceCollide(space, NULL, NearCallback);
-                dWorldStep(world, counter / 1000.0);
+                dWorldStep(world, counter);
                 dJointGroupEmpty(contactGroup);
                 counter = 0;
 
@@ -214,8 +226,7 @@ static i8 StartServer(void) {
                         rot = dGeomGetRotation(bodies[i].geom);
                     }
 
-                    bodyStates[i].pos = (Vector3){pos[0], pos[1], pos[2]};
-                    bodyStates[i].rot = (Vector3){0.f, 0.f, 0.f}; // TODO probably just send rotation matrix
+                    GetTransformMat(bodyStates[i].transform, pos, rot);
                 }
 
                 MsgUpdateBodies updatedBodies = { .msg = MSGTYPE_C_UPDATE_BODIES };
@@ -223,18 +234,9 @@ static i8 StartServer(void) {
                 ENetPacket* packet = enet_packet_create(&updatedBodies, sizeof(MsgUpdateBodies), ENET_PACKET_FLAG_RELIABLE);
                 enet_host_broadcast(host, 0, packet);
             }
-
-            BeginDrawing();
-            ClearBackground(GetColor(GuiGetStyle(DEFAULT, BACKGROUND_COLOR)));
-                DrawText(info, 100 + 50 * sinf(GetTime()), 100, 40, GetColor(GuiGetStyle(DEFAULT, TEXT_COLOR_NORMAL)));
-            EndDrawing();
         }
-
-        BeginDrawing();
-        ClearBackground(GetColor(GuiGetStyle(DEFAULT, BACKGROUND_COLOR)));
-            DrawText(info, 100 + 50 * sinf(GetTime()), 100, 40, GetColor(GuiGetStyle(DEFAULT, TEXT_COLOR_NORMAL)));
-        EndDrawing();
     }
+    BREAK:
 
     enet_host_destroy(host);
     for (i32 i = 0; i < MAX_BODIES; i++) {
@@ -283,24 +285,8 @@ static void DrawScene(RenderBody* bodies) {
             continue;
         }
 
-        const Vector3 pos = bodies[i].state.pos;
-        const Vector3 rot = bodies[i].state.rot;
-
-        // TODO fix this
-        // bodies[i].display.transform = (Matrix){
-        //     0.f, 0.f, 0.f, pos.x,
-        //     0.f, 0.f, 0.f, pos.y,
-        //     0.f, 0.f, 0.f, pos.z,
-        //     0.f, 0.f, 0.f, 1.f
-        // };
-        // bodies[i].display.transform = (Matrix){
-        //     rot[0], rot[1], rot[2], pos[0],
-        //     rot[4], rot[5], rot[6], pos[1],
-        //     rot[8], rot[9], rot[10], pos[2],
-        //     0.f, 0.f, 0.f, 1.f
-        // };
-
-        DrawModel(bodies[i].display, pos, 1.f, bodies[i].state.col);
+        bodies[i].display.transform = GetRLFromODEMat(bodies[i].state.transform);
+        DrawModel(bodies[i].display, (Vector3){0.f, 0.f, 0.f}, 1.f, bodies[i].state.col);
     }
 
     for (i32 i = 0; i < MAX_PLAYERS; i++) {
@@ -362,7 +348,7 @@ i32 main(void) {
     lightCam.target = Vector3Zero();
     lightCam.projection = CAMERA_ORTHOGRAPHIC;
     lightCam.up = (Vector3){ 0.0f, 1.0f, 0.0f };
-    lightCam.fovy = 200.0f;
+    lightCam.fovy = 180.0f;
 
     while (!WindowShouldClose()) {
         const f64 deltaTime = GetFrameTime();
@@ -435,7 +421,6 @@ i32 main(void) {
                         case MSGTYPE_C_UPDATE_BODIES: {
                             const MsgUpdateBodies* updateMsg = (MsgUpdateBodies*)event.packet->data;
                             for (i32 i = 0; i < MAX_BODIES; i++) {
-                                const Vector3 p = updateMsg->bodies[i].pos;
                                 if (BODYTYPE_NULL == bodies[i].state.type && BODYTYPE_NULL != updateMsg->bodies[i].type) {
                                     const Vector3 s = updateMsg->bodies[i].size;
                                     switch (updateMsg->bodies[i].type) {
@@ -448,7 +433,6 @@ i32 main(void) {
                                         case BODYTYPE_NULL: break; // can't happen
                                     }
                                     bodies[i].display.materials[0].shader = shadowShader;
-                                    printf("CREATED NEW MESH, SIZE: %f %f %f, POS: %f %f %f\n", s.x, s.y, s.z, p.x, p.y, p.z);
                                 }
 
                                 bodies[i].state = updateMsg->bodies[i];
@@ -486,7 +470,7 @@ i32 main(void) {
         if (IsKeyDown(KEY_UP)    && lightDir.z <  0.6f) lightDir.z += cameraSpeed;
         if (IsKeyDown(KEY_DOWN)  && lightDir.z > -0.6f) lightDir.z -= cameraSpeed;
         lightDir = Vector3Normalize(lightDir);
-        lightCam.position = Vector3Scale(lightDir, -200.0f);
+        lightCam.position = Vector3Scale(lightDir, -180.0f);
         SetShaderValue(shadowShader, lightDirLoc, &lightDir, SHADER_UNIFORM_VEC3);
 
         static f32 spawnTimer = 0.f;
@@ -495,31 +479,31 @@ i32 main(void) {
             spawnTimer = 0.0f;
             const Vector3 pos = {Rand_Double(-4.0, 4.0), Rand_Double(20.0, 50.0), Rand_Double(-4.0, 4.0)};
             if (Rand_Int(0, 2) == 0) {
-                ClientAddBody((BodyState){
+                BodyState state = {
                     .type = BODYTYPE_BOX,
-                    .pos = pos,
-                    .rot = (Vector3){0.f, 0.f, 0.f},
                     .size = (Vector3){Rand_Double(0.2, 1.0), Rand_Double(0.2, 1.0), Rand_Double(0.2, 1.0)},
                     .col = Rand_Color(30, 190)
-                });
+                };
+                GetTransformMatV(state.transform, pos, (Vector3){0.f, 0.f, 0.f});
+                ClientAddBody(state);
             } else {
-                ClientAddBody((BodyState){
+                BodyState state = {
                     .type = BODYTYPE_SPHERE,
-                    .pos = pos,
-                    .rot = (Vector3){0.f, 0.f, 0.f},
                     .size = (Vector3){Rand_Double(0.1, 0.4), 0.f, 0.f},
                     .col = Rand_Color(30, 190)
-                });
+                };
+                GetTransformMatV(state.transform, pos, (Vector3){0.f, 0.f, 0.f});
+                ClientAddBody(state);
             }
         }
         if (IsKeyReleased(KEY_SPACE)) {
-            ClientAddBody((BodyState){
+            BodyState state = {
                 .type = BODYTYPE_SPHERE,
-                .pos = camPos,
-                .rot = (Vector3){0.f, 0.f, 0.f},
-                .size = (Vector3){0.15f, 0.f, 0.f},
+                .size = (Vector3){0.15, 0.f, 0.f},
                 .col = Rand_Color(30, 190)
-            });
+            };
+            GetTransformMatV(state.transform, camPos, (Vector3){0.f, 0.f, 0.f});
+            ClientAddBody(state);
             // TODO allow clients to create bodies with initial forces
             // dBodyAddForce(bodies[ball].body, player.dir.x * 10000.f, player.dir.y * 10000.f, player.dir.z * 10000.f);
         }
@@ -551,25 +535,8 @@ i32 main(void) {
                         continue;
                     }
 
-                    const Vector3 pos = bodies[i].state.pos;
-                    // const Vector3 rot = bodies[i].state.rot;
-
-                    // TODO fix this
-                    const f32 transform[16] = {
-                        0.f, 0.f, 0.f, 0.f,
-                        0.f, 0.f, 0.f, 0.f,
-                        0.f, 0.f, 0.f, 0.f,
-                        pos.x, pos.y, pos.z, 1.f
-                    };
-                    // const f32 transform[16] = {
-                    //     rot[0], rot[4], rot[8],  0.0f,
-                    //     rot[1], rot[5], rot[9],  0.0f,
-                    //     rot[2], rot[6], rot[10], 0.0f,
-                    //     pos[0], pos[1], pos[2],  1.0f
-                    // };
-
                     rlPushMatrix();
-                    rlMultMatrixf(transform);
+                    rlMultMatrixf(MatrixToFloat(GetRLFromODEMat(bodies[i].state.transform)));
 
                     switch (bodies[i].state.type) {
                         case BODYTYPE_NULL: break; // obviously can't happen just to make lsp happy
@@ -590,6 +557,11 @@ i32 main(void) {
             }
             DrawSphere(lightCam.position, 1.f, lightColor);
             DrawSphereWires(lightCam.position, 1.f, 10, 10, BLACK);
+
+            const Vector3 ap = {3.f, 12.f, 3.f};
+            DrawCylinderEx(ap, (Vector3){ap.x + 5.f, ap.y, ap.z}, 0.15f, 0.15f, 10, RED);
+            DrawCylinderEx(ap, (Vector3){ap.x, ap.y + 5.f, ap.z}, 0.15f, 0.15f, 10, GREEN);
+            DrawCylinderEx(ap, (Vector3){ap.x, ap.y, ap.z + 5.f}, 0.15f, 0.15f, 10, BLUE);
         EndMode3D();
         if (IsKeyDown(KEY_Z)) {
             DrawTextureEx(shadowMap.depth, (Vector2){0, 0}, 0.f, 0.6f, WHITE);
@@ -601,6 +573,78 @@ i32 main(void) {
     UnloadShadowmapRenderTexture(shadowMap);
     CloseWindow();
     return 0;
+}
+
+static inline void GetTransformMat(dReal res[16], const dReal* pos, const dReal* rot) {
+    res[0] = rot[0];
+    res[1] = rot[4];
+    res[2] = rot[8];
+    res[3] = 0.0;
+
+    res[4] = rot[1];
+    res[5] = rot[5];
+    res[6] = rot[9];
+    res[7] = 0.0;
+
+    res[8] = rot[2];
+    res[9] = rot[6];
+    res[10] = rot[10];
+    res[11] = 0.0;
+
+    res[12] = pos[0];
+    res[13] = pos[1];
+    res[14] = pos[2];
+    res[15] = 1.0;
+}
+
+static inline void GetTransformMatV(dReal res[16], Vector3 pos, Vector3 rot) {
+    const dReal cx = cos(rot.x);
+    const dReal sx = sin(rot.x);
+    const dReal cy = cos(rot.y);
+    const dReal sy = sin(rot.y);
+    const dReal cz = cos(rot.z);
+    const dReal sz = sin(rot.z);
+
+    res[0] = cy * cz;
+    res[1] = cz * sx * sy - cx * sz;
+    res[2] = cx * cz * sy + sx * sz;
+    res[3] = 0.0;
+
+    res[4] = cy * sz;
+    res[5] = cx * cz + sx * sy * sz;
+    res[6] = -cz * sx + cx * sy * sx;
+    res[7] = 0.0;
+
+    res[8] = -sy;
+    res[9] = cy * sx;
+    res[10] = cx * cy;
+    res[11] = 0.0;
+
+    res[12] = pos.x;
+    res[13] = pos.y;
+    res[14] = pos.z;
+    res[15] = 1.0;
+}
+
+static inline void GetTransMatPos(dReal res[3], const dReal trans[16]) {
+    res[0] = trans[12];
+    res[1] = trans[13];
+    res[2] = trans[14];
+}
+
+static inline void GetTransMatRot(dReal res[12], const dReal trans[16]) {
+    for (i32 i = 0; i < 12; i++) {
+        res[i] = trans[i];
+    }
+}
+
+static inline Matrix GetRLFromODEMat(const dReal mat[16]) {
+    return (Matrix){
+        .m0  = mat[0],   .m1 = mat[1],  .m2  = mat[2],  .m3  = mat[3],
+        .m4  = mat[4],   .m5 = mat[5],  .m6  = mat[6],  .m7  = mat[7],
+        .m8  = mat[8],   .m9 = mat[9],  .m10 = mat[10], .m11 = mat[11],
+        .m12 = mat[12], .m13 = mat[13], .m14 = mat[14], .m15 = mat[15]
+    };
 }
 
 static void NearCallback(void* data, dGeomID o1, dGeomID o2) {
@@ -624,49 +668,20 @@ static void NearCallback(void* data, dGeomID o1, dGeomID o2) {
     }
 }
 
-static inline void GetRotationMatrix(dReal res[16], Vector3 rot) {
-    const dReal cx = cos(rot.x);
-    const dReal sx = sin(rot.x);
-    const dReal cy = cos(rot.y);
-    const dReal sy = sin(rot.y);
-    const dReal cz = cos(rot.z);
-    const dReal sz = sin(rot.z);
-
-    res[0] = cy * cz;
-    res[1] = cz * sx * sy - cx * sz;
-    res[2] = cx * cz * sy + sx * sz;
-    res[3] = 0;
-
-    res[4] = cy * sz;
-    res[5] = cx * cz + sx * sy * sz;
-    res[6] = -cz * sx + cx * sy * sx;
-    res[7] = 0;
-
-    res[8] = -sy;
-    res[9] = cy * sx;
-    res[10] = cx * cy;
-    res[11] = 0;
-
-    res[12] = 0;
-    res[13] = 0;
-    res[14] = 0;
-    res[15] = 1;
-}
-
 static i32 AddBody(Body* bodies, BodyState* states, CollMask category, CollMask collide, BodyState state, i8 isKinematic) {
     for (i32 i = 0; i < MAX_BODIES; i++) {
         if (bodies[i].type != BODYTYPE_NULL) {
             continue;
         }
 
-
         Body* body = &bodies[i];
         body->type = state.type;
         body->body = dBodyCreate(world);
-        dBodySetPosition(body->body, state.pos.x, state.pos.y, state.pos.z);
 
-        dReal rm[16];
-        GetRotationMatrix(rm, state.rot);
+        dReal pos[3], rm[12];
+        GetTransMatPos(pos, state.transform);
+        GetTransMatRot(rm, state.transform);
+        dBodySetPosition(body->body, pos[0], pos[1], pos[2]);
         dBodySetRotation(body->body, rm);
 
         if (isKinematic) {
@@ -676,15 +691,12 @@ static i32 AddBody(Body* bodies, BodyState* states, CollMask category, CollMask 
         switch (state.type) {
             case BODYTYPE_SPHERE: {
                 body->geom = dCreateSphere(space, state.size.x);
-                // body->display = LoadModelFromMesh(GenMeshSphere(state.size.x, 18, 18));
             } break;
             case BODYTYPE_BOX: {
                 body->geom = dCreateBox(space, state.size.x, state.size.y, state.size.z);
-                // body->display = LoadModelFromMesh(GenMeshCube(state.size.x, state.size.y, state.size.z));
             } break;
             default: return -1;
         }
-        // body->display.materials[0].shader = shadowShader;
         dGeomSetCategoryBits(body->geom, category);
         dGeomSetCollideBits(body->geom, collide);
         dGeomSetBody(body->geom, body->body);
@@ -706,16 +718,18 @@ static i32 AddBodyMap(Body* bodies, BodyState* states, Vector3 pos, Vector3 rot,
         body->type = BODYTYPE_BOX;
         body->geom = dCreateBox(space, size.x, size.y, size.z);
 
-        dReal rm[16];
-        GetRotationMatrix(rm, rot);
-        dGeomSetRotation(body->geom, rm);
+        dReal trans[16], rm[12];
+        GetTransformMatV(trans, pos, rot);
+        GetTransMatRot(rm, trans);
         dGeomSetPosition(body->geom, pos.x, pos.y, pos.z);
+        dGeomSetRotation(body->geom, rm);
 
         dGeomSetCategoryBits(body->geom, CMASK_MAP);
         dGeomSetCategoryBits(body->geom, CMASK_ALL & ~CMASK_MAP);
         body->body = NULL;
 
-        states[i] = (BodyState){ .pos = pos, .rot = rot, .size = size, .col = col, .type = BODYTYPE_BOX };
+        states[i] = (BodyState){ .size = size, .col = col, .type = BODYTYPE_BOX };
+        memcpy(states[i].transform, trans, sizeof(dReal) * 16);
         return i;
     }
 

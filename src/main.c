@@ -2,14 +2,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <ifaddrs.h>
-#include <arpa/inet.h>
 
 #include "raylib.h"
 #include "raymath.h"
 #include "rlgl.h"
 #define RAYGUI_IMPLEMENTATION
-#include "../inc/raygui.h"
+#include "raygui.h"
 #include "ode/ode.h"
 #include "enet/enet.h"
 
@@ -18,9 +16,16 @@
 #include "../inc/msgs.h"
 #include "../inc/player.h"
 
+#ifdef _WIN32
+    #include <arpa/inet.h>
+    #include <ifaddrs.h>
+#endif
+
 #define MAX_PITCH (89.f * DEG2RAD)
 
 #define SHADOWMAP_RESOLUTION 2048
+
+#define BROADCAST_TIME (1.f / 60.f)
 
 typedef struct peerInfo {
     ENetPeer* peer;
@@ -68,13 +73,14 @@ static i8 StartServer(void) {
 
     printf("Server started on port %u.\n", host->address.port);
 
+#ifdef _WIN32
     struct ifaddrs* interfaces;
     if (getifaddrs(&interfaces) == 0) {
         printf("Server available on the following IP addresses:\n");
         for (struct ifaddrs* ifa = interfaces; ifa != NULL; ifa = ifa->ifa_next) {
             if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET) { // Only IPv4 addresses
                 char ip[INET_ADDRSTRLEN];
-                struct sockaddr_in *sockAddr = (struct sockaddr_in *)ifa->ifa_addr;
+                struct sockaddr_in* sockAddr = (struct sockaddr_in*)ifa->ifa_addr;
                 inet_ntop(AF_INET, &sockAddr->sin_addr, ip, INET_ADDRSTRLEN);
                 printf("  %s (%s)\n", ip, ifa->ifa_name);
             }
@@ -83,6 +89,7 @@ static i8 StartServer(void) {
     } else {
         perror("getifaddrs");
     }
+#endif
 
     dInitODE();
     world = dWorldCreate();
@@ -108,9 +115,9 @@ static i8 StartServer(void) {
     const i32 mainFloor = AddBodyMap(bodies, bodyStates, (Vector3){0.f, 0.f, 0.f}, (Vector3){0.f, 0.f, 0.f}, (Vector3){100.f, 1.f, 100.f}, DARKGRAY);
     // bodies[mainFloor].display.materials->maps[MATERIAL_MAP_DIFFUSE].texture = texture;
 
-    // AddBodyMap(bodies, bodyStates, (Vector3){4.f, 3.f, 0.f}, (Vector3){0.f, 0.f, -0.5f}, (Vector3){0.5f, 8.f, 12.f}, RED);
+    AddBodyMap(bodies, bodyStates, (Vector3){4.f, 3.f, 0.f}, (Vector3){0.f, 0.f, -0.5f}, (Vector3){0.5f, 8.f, 12.f}, RED);
     // AddBodyMap(bodies, bodyStates, (Vector3){-4.f, 3.f, 0.f}, (Vector3){0.f, 0.f, 0.5f}, (Vector3){0.5f, 8.f, 12.f}, YELLOW);
-    AddBodyMap(bodies, bodyStates, (Vector3){0.f, 3.f, 6.f}, (Vector3){0.f, 0.f, M_PI / 2}, (Vector3){12.f, 8.f, 0.5f}, GREEN);
+    AddBodyMap(bodies, bodyStates, (Vector3){0.f, 3.f, 6.f}, (Vector3){0.f, 0.f, 0.f}, (Vector3){12.f, 8.f, 0.5f}, GREEN);
     AddBodyMap(bodies, bodyStates, (Vector3){0.f, 3.f, -6.f}, (Vector3){0.f, 0.f, 0.f}, (Vector3){12.f, 8.f, 0.5f}, BLUE);
 
     ENetEvent event;
@@ -118,7 +125,7 @@ static i8 StartServer(void) {
     while (!WindowShouldClose()) {
         BeginDrawing();
         ClearBackground(GetColor(GuiGetStyle(DEFAULT, BACKGROUND_COLOR)));
-            DrawText(info, 100 + 50 * sinf(GetTime()), 100, 40, GetColor(GuiGetStyle(DEFAULT, TEXT_COLOR_NORMAL)));
+            DrawText(TextFormat("DOING NOTHING, LAST THING:\n%s", info), 100 + 50 * sinf(GetTime()), 100, 40, GetColor(GuiGetStyle(DEFAULT, TEXT_COLOR_NORMAL)));
         EndDrawing();
 
         while (enet_host_service(host, &event, 500) > 0) {
@@ -131,7 +138,7 @@ static i8 StartServer(void) {
                 DrawText(info, 100 + 50 * sinf(GetTime()), 100, 40, GetColor(GuiGetStyle(DEFAULT, TEXT_COLOR_NORMAL)));
             EndDrawing();
 
-            u8 playerUpdated = 0;
+            static u8 playerUpdated = 0;
             switch (event.type) {
                 case ENET_EVENT_TYPE_CONNECT: {
                     info = TextFormat("A new client connected from %x:%u\n%s", event.peer->address.host, event.peer->address.port, info);
@@ -163,13 +170,13 @@ static i8 StartServer(void) {
                     info = TextFormat("Packet received from client on channel %u\n", event.channelID);
                     switch (*(MsgType*)event.packet->data) {
                         case MSGTYPE_S_PLAYER_UPDATE: {
-                            MsgPlayerUpdate* player = (MsgPlayerUpdate*)event.packet->data;
+                            const MsgPlayerUpdate* player = (MsgPlayerUpdate*)event.packet->data;
                             players[player->player.id] = player->player;
                             playerUpdated = 1;
                             info = TextFormat("Updated player %d\n%s", player->player.id, info);
                         } break;
                         case MSGTYPE_S_NEW_BODY: {
-                            MsgNewBody* body = (MsgNewBody*)event.packet->data;
+                            const MsgNewBody* body = (MsgNewBody*)event.packet->data;
                             const BodyState state = body->body;
                             const i32 id = AddBody(bodies, bodyStates, CMASK_OBJ, CMASK_OBJ | CMASK_MAP, state, 0);
                         } break;
@@ -187,7 +194,7 @@ static i8 StartServer(void) {
                         players[i].id = peerInfo[i].playerID = -1;
                         peerInfo[i].peer = NULL;
                         playerUpdated = 1;
-                        info = TextFormat("Client disconnected\n");
+                        info = TextFormat("Client disconnected");
                         break;
                     }
                 } break;
@@ -196,21 +203,21 @@ static i8 StartServer(void) {
                 } break;
             }
 
-            if (playerUpdated) {
-                MsgUpdatePlayers updatedPlayers = { .msg = MSGTYPE_C_UPDATE_PLAYERS };
-                memcpy(updatedPlayers.players, players, sizeof(players));
-                ENetPacket* packet = enet_packet_create(&updatedPlayers, sizeof(MsgUpdatePlayers), ENET_PACKET_FLAG_RELIABLE);
-                enet_host_broadcast(host, 0, packet);
+            const f32 dt = GetFrameTime();
+
+            const f32 physicsTime = 1.f / 120.f;
+            static f32 physicsTimer = 0.f;
+            physicsTimer += dt;
+            while (physicsTimer >= physicsTime) {
+                dSpaceCollide(space, NULL, NearCallback);
+                dWorldStep(world, physicsTime);
+                dJointGroupEmpty(contactGroup);
+                physicsTimer -= physicsTime;
             }
 
-            static f32 counter = 0;
-            counter += GetFrameTime();
-            if (counter > 0.016f) {
-                dSpaceCollide(space, NULL, NearCallback);
-                dWorldStep(world, counter);
-                dJointGroupEmpty(contactGroup);
-                counter = 0;
-
+            static f32 bodyBroadcastTimer = 0.f;
+            bodyBroadcastTimer += dt;
+            if (bodyBroadcastTimer >= BROADCAST_TIME) {
                 for (i32 i = 0; i < MAX_BODIES; i++) {
                     if (BODYTYPE_NULL == bodies[i].type) {
                         continue;
@@ -231,8 +238,18 @@ static i8 StartServer(void) {
 
                 MsgUpdateBodies updatedBodies = { .msg = MSGTYPE_C_UPDATE_BODIES };
                 memcpy(updatedBodies.bodies, bodyStates, sizeof(bodyStates));
-                ENetPacket* packet = enet_packet_create(&updatedBodies, sizeof(MsgUpdateBodies), ENET_PACKET_FLAG_RELIABLE);
-                enet_host_broadcast(host, 0, packet);
+                ENetPacket* bodyPacket = enet_packet_create(&updatedBodies, sizeof(MsgUpdateBodies), ENET_PACKET_FLAG_RELIABLE);
+                enet_host_broadcast(host, 0, bodyPacket);
+
+                if (playerUpdated) { // TODO make players special bodies instead of floating cameras
+                    MsgUpdatePlayers updatedPlayers = { .msg = MSGTYPE_C_UPDATE_PLAYERS };
+                    memcpy(updatedPlayers.players, players, sizeof(players));
+                    ENetPacket* playerPacket = enet_packet_create(&updatedPlayers, sizeof(MsgUpdatePlayers), ENET_PACKET_FLAG_RELIABLE);
+                    enet_host_broadcast(host, 0, playerPacket);
+                    playerUpdated = 0;
+                }
+
+                bodyBroadcastTimer = 0.f;
             }
         }
     }
@@ -260,13 +277,13 @@ static u8 JoinServer(const i8* ip, const i8* port) {
 
     atexit(enet_deinitialize);
 
-    ENetAddress address;
     host = enet_host_create(NULL, 1, 2, 0, 0);
     if (!host) {
         TraceLog(LOG_ERROR, "Error while trying to create the client host\n");
         return 1;
     }
 
+    ENetAddress address;
     enet_address_set_host(&address, ip);
     address.port = atoi(port);
 
@@ -281,7 +298,7 @@ static u8 JoinServer(const i8* ip, const i8* port) {
 
 static void DrawScene(RenderBody* bodies) {
     for (i32 i = 0; i < MAX_BODIES; i++) {
-        if (bodies[i].state.type == BODYTYPE_NULL) {
+        if (BODYTYPE_NULL == bodies[i].state.type) {
             continue;
         }
 
@@ -290,18 +307,18 @@ static void DrawScene(RenderBody* bodies) {
     }
 
     for (i32 i = 0; i < MAX_PLAYERS; i++) {
-        if (i == localID || players[i].id == -1) {
+        if (i == localID || -1 == players[i].id) {
             continue;
         }
 
         // printf("DRAWING PLAYER %d AT: %f %f %f\n", i, players[i].pos.x, players[i].pos.y, players[i].pos.z);
         DrawSphere(players[i].pos, 0.5f, BLUE);
-        DrawLine3D(players[i].pos, Vector3Add(players[i].pos, Vector3Scale(players[i].dir, 5.f)), RED);
+        DrawCylinderEx(players[i].pos, Vector3Add(players[i].pos, Vector3Scale(players[i].dir, 2.f)), 0.2f, 0.05f, 16, RED);
     }
 }
 
 i32 main(void) {
-    SetTargetFPS(1000);
+    SetTargetFPS(500);
     SetExitKey(KEY_RIGHT_SHIFT);
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     InitWindow(1280, 720, "Window");
@@ -351,7 +368,7 @@ i32 main(void) {
     lightCam.fovy = 180.0f;
 
     while (!WindowShouldClose()) {
-        const f64 deltaTime = GetFrameTime();
+        const f32 deltaTime = GetFrameTime();
 
         static i8 isInMainMenu = 1;
         if (isInMainMenu) {
@@ -397,7 +414,7 @@ i32 main(void) {
         }
 
         ENetEvent event;
-        while (enet_host_service(host, &event, 0) > 0) {
+        while (enet_host_service(host, &event, 6) > 0) {
             switch (event.type) {
                 case ENET_EVENT_TYPE_RECEIVE: {
                     switch (*(MsgType*)event.packet->data) {
@@ -448,7 +465,7 @@ i32 main(void) {
             }
         }
 
-        if (localID == -1) {
+        if (-1 == localID) {
             BeginDrawing();
             ClearBackground(BLACK);
                 DrawText("Waiting to receive ID from server", 100, 100, 30, RAYWHITE);
@@ -457,9 +474,16 @@ i32 main(void) {
         }
 
         Player_UpdateLocal(2.f, 2.f, deltaTime);
-        MsgPlayerUpdate msg = { .msg = MSGTYPE_S_PLAYER_UPDATE, .player = players[localID] };
-        ENetPacket* packet = enet_packet_create(&msg, sizeof(MsgPlayerUpdate), ENET_PACKET_FLAG_RELIABLE);
-        enet_peer_send(peer, 0, packet);
+
+        static f32 playerBroadcastTimer = 0.f;
+        playerBroadcastTimer += deltaTime;
+        if (playerBroadcastTimer >= BROADCAST_TIME) {
+            MsgPlayerUpdate msg = { .msg = MSGTYPE_S_PLAYER_UPDATE, .player = players[localID] };
+            ENetPacket* packet = enet_packet_create(&msg, sizeof(MsgPlayerUpdate), ENET_PACKET_FLAG_RELIABLE);
+            enet_peer_send(peer, 0, packet);
+
+            playerBroadcastTimer = 0.f;
+        }
 
         const Vector3 camPos = playerCam.position;
         SetShaderValue(shadowShader, shadowShader.locs[SHADER_LOC_VECTOR_VIEW], &camPos, SHADER_UNIFORM_VEC3);
@@ -737,7 +761,7 @@ static i32 AddBodyMap(Body* bodies, BodyState* states, Vector3 pos, Vector3 rot,
 }
 
 static void ReleaseBody(RenderBody* bodies, i32 id) {
-    if (bodies[id].state.type == BODYTYPE_NULL) {
+    if (BODYTYPE_NULL == bodies[id].state.type) {
         return;
     }
 
